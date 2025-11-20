@@ -4,28 +4,56 @@ from llama_index.core.node_parser import SentenceSplitter
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
 import re
 from typing import Any
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import numpy as np
+from llama_index.core.query_engine import CustomQueryEngine
+from llama_index.core.llms import LLM
+from google import genai
 
-# Load sample dataset
-news = pd.read_csv("https://raw.githubusercontent.com/tomasonjo/blog-datasets/main/news_articles.csv")[:20]  # Reduced for testing
+# Load markdown file
+with open("src2/novel.md", "r", encoding="utf-8") as f:
+    novel_text = f.read()
 
-# Convert data into LlamaIndex Document objects
-documents = [
-    Document(text=f"{row['title']}: {row['text']}")
-    for _, row in news.iterrows()
-]
+# Create a single document from the entire text
+documents = [Document(text=novel_text)]
 
+# Use SentenceSplitter to chunk the document
 splitter = SentenceSplitter(
-    chunk_size=512,  # Reduced chunk size for better extraction
+    chunk_size=1024,  # Reduced chunk size for better extraction
     chunk_overlap=20,
 )
+
 nodes = splitter.get_nodes_from_documents(documents)
 
 from llama_index.llms.ollama import Ollama
+from llama_index.llms.vertex import Vertex
+from llama_index.core.llms import ChatMessage, MessageRole
+import vertexai
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 
-llm = Ollama(
-    model="llama3.2:3b",  # Using a smaller model for this Hackathon but we can scale it up if necessary. 
-    request_timeout=6000.0,
-)
+GCP_PROJECT = "finrisk-sandbox"
+GCP_LOCATION = "us-central1"
+vertexai.init(project= GCP_PROJECT, location="us-central1")
+# Configure safety settings to be more permissive
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+llm = Vertex(model="gemini-2.5-flash-lite", safety_settings=safety_settings, max_tokens=10000)
+
+
+# llm = Ollama(
+#     model="qwen3:4b-instruct",  # Using a smaller model for this Hackathon but we can scale it up if necessary. 
+#     request_timeout=600000.0,
+# )
+
+# client = genai.Client(
+#     vertexai=True, project='finrisk-sandbox', location='us-central1'
+# )
 
 # Simplified patterns that are easier for the LLM to follow
 entity_pattern = r'ENTITY:\s*(.+?)\s*TYPE:\s*(.+?)\s*DESC:\s*(.+?)(?=\s*ENTITY:|\s*RELATIONSHIP:|\s*$)'
@@ -172,34 +200,68 @@ class GraphRAGExtractor(TransformComponent):
 
 # Simplified prompt that's easier for the LLM to follow
 KG_TRIPLET_EXTRACT_TMPL = """
-Please analyze the following text and extract entities and relationships.
+-Goal-
+Given a text document, identify all important entities and their types, and extract all relationships among the identified entities.
+Extract up to {max_knowledge_triplets} of the most important entity-relation triplets.
 
+-Steps-
+1. Identify all important ENTITIES from the text. For each entity, extract:
+   - Entity name: Name of the entity (capitalized, use full names when possible)
+   - Entity type: One of: person, organization, location, event, concept, object
+   - Entity description: Comprehensive description of the entity's attributes, role, and activities
+
+   Format each entity as:
+   ENTITY: [entity name]
+   TYPE: [entity type]
+   DESC: [entity description]
+
+2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly and directly related* to each other.
+   Only extract relationships where there is an explicit connection mentioned in the text.
+
+   For each pair of related entities, extract:
+   - Source entity: name of the source entity (exactly as identified in step 1)
+   - Target entity: name of the target entity (exactly as identified in step 1)
+   - Relationship type: Specific relationship type (e.g., works_for, located_in, part_of, involved_in, created_by, member_of, related_to, etc.)
+   - Relationship description: Clear explanation of why these entities are related, based on the text
+
+   Format each relationship as:
+   RELATIONSHIP: [source entity] -> [target entity]
+   TYPE: [relationship type]
+   DESC: [relationship description]
+
+3. Prioritize the most important and clearly stated entities and relationships. Do not extract vague or inferred connections.
+
+-Examples-
+
+Example 1:
+ENTITY: Francis Bacon
+TYPE: person
+DESC: English philosopher and statesman, born in 1560
+
+RELATIONSHIP: Francis Bacon -> Trinity College
+TYPE: attended
+DESC: Studied at Trinity College Cambridge
+
+Example 2:
+ENTITY: Trinity College
+TYPE: organization
+DESC: University college in Cambridge where Francis Bacon studied
+
+RELATIONSHIP: Trinity College -> Cambridge
+TYPE: located_in
+DESC: Trinity College is located in the city of Cambridge
+
+-Important Notes-
+- Use the EXACT format shown above with ENTITY:, TYPE:, DESC:, RELATIONSHIP:, and -> symbols
+- Entity names must match exactly between entities and relationships
+- Only extract relationships that are explicitly stated or clearly implied in the text
+- Focus on quality over quantity - extract the most important connections
+- If an entity appears multiple times, use the same name consistently
+
+-Real Data-
 TEXT: {text}
 
-INSTRUCTIONS:
-1. Extract important ENTITIES. For each entity, provide:
-ENTITY: [entity name]
-TYPE: [person, organization, location, event, concept, object]
-DESC: [brief description]
-
-2. Extract RELATIONSHIPS between entities. For each relationship, provide:
-RELATIONSHIP: [source entity] -> [target entity]
-TYPE: [relationship type like works_for, located_in, part_of, involved_in, etc.]
-DESC: [brief description of the relationship]
-
-IMPORTANT: Use the exact format above. Extract up to {max_knowledge_triplets} of the most important entities and relationships.
-
-EXAMPLES:
-ENTITY: Barack Obama
-TYPE: person
-DESC: Former President of the United States
-
-RELATIONSHIP: Barack Obama -> United States
-TYPE: president_of
-DESC: Served as the 44th President
-
-Now analyze this text:
-{text}
+Now analyze this text and extract entities and relationships following the format above:
 """
 
 kg_extractor = GraphRAGExtractor(
@@ -238,6 +300,77 @@ class GraphRAGStore(SimplePropertyGraphStore):
         response = Ollama(model="llama3.2:3b", request_timeout=6000.0).chat(messages)
         clean_response = re.sub(r"^assistant:\s*", "", str(response)).strip()
         return clean_response
+    
+    def get_community_graph(self):
+        """Creates a simplified graph where nodes are communities."""
+        nx_graph = self._create_nx_graph()
+        community_hierarchical_clusters = hierarchical_leiden(
+            nx_graph, max_cluster_size=self.max_cluster_size
+        )
+        
+        # Create mapping: node -> community_id
+        community_mapping = {item.node: item.cluster for item in community_hierarchical_clusters}
+        
+        # Create simplified community graph
+        community_graph = nx.Graph()
+        
+        # Add community nodes with summaries
+        community_nodes = {}
+        for cluster_id in set(community_mapping.values()):
+            summary = self.community_summary.get(cluster_id, f"Community {cluster_id}")
+            # Truncate summary for display
+            short_summary = summary[:100] + "..." if len(summary) > 100 else summary
+            community_nodes[cluster_id] = short_summary
+            community_graph.add_node(cluster_id, summary=summary, label=f"Community {cluster_id}")
+        
+        # Add edges between communities (if nodes in different communities are connected)
+        inter_community_edges = {}
+        for u, v, data in nx_graph.edges(data=True):
+            comm_u = community_mapping.get(u)
+            comm_v = community_mapping.get(v)
+            
+            if comm_u != comm_v:  # Edge between different communities
+                if (comm_u, comm_v) not in inter_community_edges:
+                    inter_community_edges[(comm_u, comm_v)] = []
+                inter_community_edges[(comm_u, comm_v)].append(data.get('relationship', 'unknown'))
+        
+        # Add edges to community graph (weight = number of connections)
+        for (comm_u, comm_v), relationships in inter_community_edges.items():
+            community_graph.add_edge(comm_u, comm_v, 
+                                    weight=len(relationships),
+                                    relationships=relationships)
+        
+        return community_graph, community_nodes
+    
+    def get_communities_at_level(self, level=0):
+        """
+        Extract communities at a specific hierarchical level.
+        Level 0 = root/coarse communities (larger)
+        Level 1 = sub-communities (finer)
+        Higher levels = even finer granularity
+        """
+        nx_graph = self._create_nx_graph()
+        
+        # For level 0, use a larger max_cluster_size to get coarser communities
+        # For level 1, use smaller max_cluster_size to get finer communities
+        if level == 0:
+            # Root level: larger communities (less granular)
+            max_size = max(50, len(nx_graph.nodes()) // 5)  # Adaptive based on graph size
+        elif level == 1:
+            # Level 1: finer communities (more granular)
+            max_size = self.max_cluster_size  # Use your existing setting
+        else:
+            # Even finer levels
+            max_size = max(2, self.max_cluster_size // (level + 1))
+        
+        community_hierarchical_clusters = hierarchical_leiden(
+            nx_graph, max_cluster_size=max_size
+        )
+        
+        # Create mapping: node -> community_id at this level
+        community_mapping = {item.node: item.cluster for item in community_hierarchical_clusters}
+        
+        return community_mapping, nx_graph
     
     def build_communities(self):
         """Builds communities from the graph and summarizes them."""
@@ -294,6 +427,9 @@ class GraphRAGStore(SimplePropertyGraphStore):
 
     def get_community_summaries(self):
         """Returns the community summaries, building them if not already done."""
+        with open("community_summaries.pkl", "rb") as f:
+          import pickle
+          self.community_summary = pickle.load(f)
         if not self.community_summary:
             self.build_communities()
         return self.community_summary
@@ -308,7 +444,7 @@ embeddings = OllamaEmbedding(
 # Create index with debug info
 print("Creating PropertyGraphIndex...")
 index = PropertyGraphIndex(
-    nodes=nodes[:10],  # Start with just 10 nodes for testing
+    nodes=nodes[:5],  # Start with just 10 nodes for testing
     llm=llm,
     embed_model=embeddings,
     property_graph_store=GraphRAGStore(),
@@ -316,7 +452,7 @@ index = PropertyGraphIndex(
     show_progress=True,
 )
 
-PERSIST_DIR = "Hackathon"
+PERSIST_DIR = "Novel"
 from llama_index.core import (
     PropertyGraphIndex,
     StorageContext,
@@ -324,7 +460,7 @@ from llama_index.core import (
 )
 
 # Store the index so that it can be loaded in later if necessary. Uncomment the code below to load in the index. 
-index.storage_context.persist(persist_dir=PERSIST_DIR)
+
 # graph_store = GraphRAGStore.from_persist_dir(PERSIST_DIR)
 
 # storage_context = StorageContext.from_defaults(
@@ -343,18 +479,15 @@ if (index.property_graph_store.graph.nodes and
     index.property_graph_store.graph.relations):
     print("Building communities...")
     index.property_graph_store.build_communities()
-    
-    # Print community summaries
-    summaries = index.property_graph_store.get_community_summaries()
-    print("Community Summaries:")
-    for community_id, summary in summaries.items():
-        print(f"Community {community_id}: {summary}")
+    index.storage_context.persist(persist_dir=PERSIST_DIR)
+   
 else:
     print("No graph data extracted. Check the LLM extraction output.")
 
+#index.storage_context.persist(persist_dir=PERSIST_DIR)
 
-from llama_index.core.query_engine import CustomQueryEngine
-from llama_index.core.llms import LLM
+# Visualize the simplified community graph
+
 from IPython.display import Markdown, display
 class GraphRAGQueryEngine(CustomQueryEngine):
     graph_store: GraphRAGStore
@@ -413,7 +546,7 @@ class GraphRAGQueryEngine(CustomQueryEngine):
         return cleaned_final_response
 
 llm = Ollama(
-    model="gemma3:4b",  # Using a more reliable model for extraction
+    model="qwen3:4b-instruct",  # Using a more reliable model for extraction
     request_timeout=6000.0,
 )
 query_engine = GraphRAGQueryEngine(
@@ -423,5 +556,427 @@ query_engine = GraphRAGQueryEngine(
 #         import pickle
 #         query_engine = pickle.load(f)
 
-response = query_engine.query("What is the latest news in the football transfer market.")
+response = query_engine.query("Where did Francis Bacon study?")
 print(f"{response.response}")
+
+# Get community graph
+community_graph, community_nodes = index.property_graph_store.get_community_graph()
+
+if community_graph.number_of_nodes() > 0:
+    # Create figure
+    fig, ax = plt.subplots(figsize=(20, 15))
+    
+    # Use spring layout for positioning
+    pos = nx.spring_layout(community_graph, k=2, iterations=50)
+    
+    # Get node sizes based on number of connections (degree)
+    node_sizes = [community_graph.degree(node) * 1000 + 2000 for node in community_graph.nodes()]
+    
+    # Color nodes by community ID (using a colormap)
+    node_colors = [hash(str(node)) % 256 for node in community_graph.nodes()]
+    cmap = cm.get_cmap('tab20')
+    colors = [cmap(i % 20) for i in range(len(node_colors))]
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(community_graph, pos, 
+                          node_color=colors,
+                          node_size=node_sizes,
+                          alpha=0.8,
+                          ax=ax)
+    
+    # Draw edges with thickness based on weight (number of connections)
+    edges = community_graph.edges()
+    edge_weights = [community_graph[u][v].get('weight', 1) for u, v in edges]
+    nx.draw_networkx_edges(community_graph, pos,
+                          width=[w * 0.5 for w in edge_weights],
+                          alpha=0.6,
+                          edge_color='gray',
+                          ax=ax)
+    
+    # Create labels with community summaries
+    labels = {}
+    for node in community_graph.nodes():
+        summary = community_nodes.get(node, f"Community {node}")
+        # Create multi-line label (first line: ID, second: summary)
+        labels[node] = f"C{node}\n{summary[:50]}..."
+    
+    nx.draw_networkx_labels(community_graph, pos, labels, 
+                           font_size=8, font_weight='bold', ax=ax)
+    
+    # Add edge labels showing relationship types
+    edge_labels = {}
+    for u, v, data in community_graph.edges(data=True):
+        relationships = data.get('relationships', [])
+        unique_rels = list(set(relationships))[:3]  # Show up to 3 unique relationship types
+        edge_labels[(u, v)] = f"{len(relationships)} links\n{', '.join(unique_rels)}"
+    
+    nx.draw_networkx_edge_labels(community_graph, pos, edge_labels, 
+                                font_size=6, ax=ax)
+    
+    plt.title("Simplified Community Graph\n(Nodes = Communities, Edges = Inter-community connections)", 
+              size=16, fontweight='bold')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics
+    print("\n" + "="*60)
+    print("COMMUNITY GRAPH STATISTICS")
+    print("="*60)
+    print(f"Number of communities: {community_graph.number_of_nodes()}")
+    print(f"Inter-community connections: {community_graph.number_of_edges()}")
+    print(f"\nCommunity Details:")
+    for node in sorted(community_graph.nodes()):
+        degree = community_graph.degree(node)
+        summary = community_nodes.get(node, "No summary")
+        print(f"\n  Community {node}:")
+        print(f"    Connections to other communities: {degree}")
+        print(f"    Summary: {summary[:10]}...")
+else:
+    print("No communities found in the graph.")
+def visualize_hierarchical_communities(index, level_0_max_size=None, level_1_max_size=None):
+    """
+    Create side-by-side visualization of communities at two hierarchical levels.
+    Similar to the research paper figure.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    # Get communities at level 0 (coarse/root)
+    if level_0_max_size is None:
+        level_0_max_size = max(50, len(nx_graph.nodes()) // 5)
+    clusters_level_0 = hierarchical_leiden(nx_graph, max_cluster_size=level_0_max_size)
+    mapping_level_0 = {item.node: item.cluster for item in clusters_level_0}
+    
+    # Get communities at level 1 (finer)
+    if level_1_max_size is None:
+        level_1_max_size = index.property_graph_store.max_cluster_size
+    clusters_level_1 = hierarchical_leiden(nx_graph, max_cluster_size=level_1_max_size)
+    mapping_level_1 = {item.node: item.cluster for item in clusters_level_1}
+    
+    # Create figure with two subplots side by side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 12))
+    
+    # Use the same layout for both graphs for comparison
+    pos = nx.spring_layout(nx_graph, k=1, iterations=50, seed=42)
+    
+    # Get unique communities for coloring
+    communities_0 = set(mapping_level_0.values())
+    communities_1 = set(mapping_level_1.values())
+    
+    # Create color maps
+    cmap_0 = cm.get_cmap('tab20')
+    cmap_1 = cm.get_cmap('tab20')
+    colors_0 = {comm: cmap_0(i % 20) for i, comm in enumerate(communities_0)}
+    colors_1 = {comm: cmap_1(i % 20) for i, comm in enumerate(communities_1)}
+    
+    # Add fallback color for unmapped nodes
+    default_color = (0.5, 0.5, 0.5, 1.0)  # Gray
+    colors_0[-1] = default_color
+    colors_1[-1] = default_color
+    
+    # Plot Level 0 (Root communities) - Graph (a)
+    node_colors_0 = []
+    for node in nx_graph.nodes():
+        comm_id = mapping_level_0.get(node, -1)
+        node_colors_0.append(colors_0.get(comm_id, default_color))
+    
+    nx.draw_networkx_nodes(nx_graph, pos, 
+                          node_color=node_colors_0,
+                          node_size=50,
+                          alpha=0.8,
+                          ax=ax1,
+                          edgecolors='black',
+                          linewidths=0.5)
+    nx.draw_networkx_edges(nx_graph, pos,
+                          alpha=0.2,
+                          edge_color='gray',
+                          width=0.5,
+                          ax=ax1)
+    ax1.set_title(f'(a) Root communities at level 0\n({len(communities_0)} communities, max_size={level_0_max_size})', 
+                  fontsize=14, fontweight='bold', pad=20)
+    ax1.axis('off')
+    
+    # Plot Level 1 (Sub-communities) - Graph (b)
+    node_colors_1 = []
+    for node in nx_graph.nodes():
+        comm_id = mapping_level_1.get(node, -1)
+        node_colors_1.append(colors_1.get(comm_id, default_color))
+    
+    nx.draw_networkx_nodes(nx_graph, pos, 
+                          node_color=node_colors_1,
+                          node_size=50,
+                          alpha=0.8,
+                          ax=ax2,
+                          edgecolors='black',
+                          linewidths=0.5)
+    nx.draw_networkx_edges(nx_graph, pos,
+                          alpha=0.2,
+                          edge_color='gray',
+                          width=0.5,
+                          ax=ax2)
+    ax2.set_title(f'(b) Sub-communities at level 1\n({len(communities_1)} communities, max_size={level_1_max_size})', 
+                  fontsize=14, fontweight='bold', pad=20)
+    ax2.axis('off')
+    
+    plt.suptitle('Hierarchical Community Detection', fontsize=16, fontweight='bold', y=0.98)
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics
+    print("\n" + "="*60)
+    print("HIERARCHICAL COMMUNITY STATISTICS")
+    print("="*60)
+    print(f"\nLevel 0 (Root):")
+    print(f"  Number of communities: {len(communities_0)}")
+    print(f"  Average community size: {len(nx_graph.nodes()) / len(communities_0):.1f} nodes")
+    
+    print(f"\nLevel 1 (Sub-communities):")
+    print(f"  Number of communities: {len(communities_1)}")
+    print(f"  Average community size: {len(nx_graph.nodes()) / len(communities_1):.1f} nodes")
+    
+    # Show how level 0 communities are subdivided
+    print(f"\nCommunity Subdivision Analysis:")
+    comm_0_to_1 = {}
+    for node in nx_graph.nodes():
+        comm_0 = mapping_level_0.get(node)
+        comm_1 = mapping_level_1.get(node)
+        if comm_0 not in comm_0_to_1:
+            comm_0_to_1[comm_0] = set()
+        comm_0_to_1[comm_0].add(comm_1)
+    
+    # for comm_0, sub_comms in sorted(comm_0_to_1.items())[:5]:  # Show first 5
+    #     print(f"  Level 0 Community {comm_0} contains {len(sub_comms)} sub-communities at Level 1")
+# Call the visualization function
+visualize_hierarchical_communities(index)
+
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import networkx as nx
+
+def visualize_original_graph(index):
+    """
+    Visualize the original knowledge graph with all entities (nodes) and relationships (edges).
+    """
+    # Get the NetworkX graph from the index
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    if nx_graph.number_of_nodes() == 0:
+        print("Graph is empty - no nodes to visualize.")
+        return
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(20, 16))
+    
+    # Use a layout algorithm (spring layout works well for general graphs)
+    # Adjust k parameter for spacing (larger = more spread out)
+    pos = nx.spring_layout(nx_graph, k=2, iterations=50, seed=42)
+    
+    # Calculate node sizes based on degree (more connections = larger node)
+    degrees = dict(nx_graph.degree())
+    node_sizes = [degrees[node] * 300 + 200 for node in nx_graph.nodes()]
+    
+    # Color nodes by degree (more connected = darker)
+    node_colors = [degrees[node] for node in nx_graph.nodes()]
+    
+    # Draw nodes
+    nodes = nx.draw_networkx_nodes(
+        nx_graph, 
+        pos,
+        node_color=node_colors,
+        node_size=node_sizes,
+        cmap=plt.cm.viridis,  # Color map: darker = more connections
+        alpha=0.8,
+        edgecolors='black',
+        linewidths=1.5,
+        ax=ax
+    )
+    
+    # Draw edges
+    nx.draw_networkx_edges(
+        nx_graph,
+        pos,
+        alpha=0.3,
+        edge_color='gray',
+        width=1.0,
+        ax=ax
+    )
+    
+    # Draw node labels (entity names)
+    # Only show labels for nodes with high degree to avoid clutter
+    high_degree_nodes = {node: label for node, label in zip(nx_graph.nodes(), nx_graph.nodes()) 
+                         if degrees[node] >= 3}  # Only label nodes with 3+ connections
+    
+    if high_degree_nodes:
+        nx.draw_networkx_labels(
+            nx_graph,
+            pos,
+            labels=high_degree_nodes,
+            font_size=8,
+            font_weight='bold',
+            ax=ax
+        )
+    
+    # Add colorbar for node degree
+    plt.colorbar(nodes, ax=ax, label='Number of Connections (Degree)')
+    
+    plt.title(f'Original Knowledge Graph\n({nx_graph.number_of_nodes()} entities, {nx_graph.number_of_edges()} relationships)', 
+              fontsize=16, fontweight='bold', pad=20)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics
+    print("\n" + "="*60)
+    print("KNOWLEDGE GRAPH STATISTICS")
+    print("="*60)
+    print(f"Total entities (nodes): {nx_graph.number_of_nodes()}")
+    print(f"Total relationships (edges): {nx_graph.number_of_edges()}")
+    print(f"Average connections per entity: {sum(degrees.values()) / len(degrees):.2f}")
+    print(f"\nMost connected entities:")
+    sorted_degrees = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
+    for i, (node, degree) in enumerate(sorted_degrees[:10], 1):
+        print(f"  {i}. {node}: {degree} connections")
+    
+    return nx_graph
+
+# Call the function
+visualize_original_graph(index)
+
+def visualize_original_graph_detailed(index, max_nodes=100):
+    """
+    Visualize with relationship type labels and entity details.
+    If graph is too large, only show a subset.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    if nx_graph.number_of_nodes() == 0:
+        print("Graph is empty.")
+        return
+    
+    # If graph is too large, create a subgraph with most connected nodes
+    if nx_graph.number_of_nodes() > max_nodes:
+        print(f"Graph has {nx_graph.number_of_nodes()} nodes. Showing top {max_nodes} most connected nodes.")
+        degrees = dict(nx_graph.degree())
+        top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+        top_node_list = [node for node, _ in top_nodes]
+        nx_graph = nx_graph.subgraph(top_node_list)
+    
+    # Create mapping from node IDs to clean names
+    node_id_to_name = {}
+    for node_obj in index.property_graph_store.graph.nodes.values():
+        node_id = str(node_obj.id) if hasattr(node_obj, 'id') else str(node_obj)
+        node_name = node_obj.name if hasattr(node_obj, 'name') else str(node_obj)
+        node_id_to_name[node_id] = node_name
+    
+    # Create a new graph with clean node names
+    clean_graph = nx.Graph()
+    for node_id in nx_graph.nodes():
+        clean_name = node_id_to_name.get(node_id, node_id)
+        clean_graph.add_node(clean_name)
+    
+    # Add edges with clean labels
+    for u, v, data in nx_graph.edges(data=True):
+        u_clean = node_id_to_name.get(u, u)
+        v_clean = node_id_to_name.get(v, v)
+        rel_label = data.get('relationship', 'related_to')
+        clean_graph.add_edge(u_clean, v_clean, relationship=rel_label)
+    
+    fig, ax = plt.subplots(figsize=(24, 18))
+    
+    pos = nx.spring_layout(clean_graph, k=2, iterations=50, seed=42)
+    
+    # Node sizes and colors
+    degrees = dict(clean_graph.degree())
+    node_sizes = [degrees[node] * 400 + 300 for node in clean_graph.nodes()]
+    node_colors = [degrees[node] for node in clean_graph.nodes()]
+    
+    # Draw nodes
+    nodes = nx.draw_networkx_nodes(
+        clean_graph, pos,
+        node_color=node_colors,
+        node_size=node_sizes,
+        cmap=plt.cm.plasma,
+        alpha=0.9,
+        edgecolors='black',
+        linewidths=2,
+        ax=ax
+    )
+    
+    # Draw edges
+    nx.draw_networkx_edges(
+        clean_graph, pos,
+        alpha=0.4,
+        edge_color='gray',
+        width=1.5,
+        ax=ax
+    )
+    
+    # Add edge labels (relationship types) - only for a subset to avoid clutter
+    edge_labels = {}
+    for u, v, data in list(clean_graph.edges(data=True))[:50]:  # Show first 50 edges
+        rel = data.get('relationship', '')
+        if rel:
+            edge_labels[(u, v)] = rel[:15]  # Truncate long names
+    
+    nx.draw_networkx_edge_labels(
+        clean_graph, pos,
+        edge_labels=edge_labels,
+        font_size=6,
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
+        ax=ax
+    )
+    
+    # Add node labels (entity names)
+    nx.draw_networkx_labels(
+        clean_graph, pos,
+        font_size=7,
+        font_weight='bold',
+        ax=ax
+    )
+    
+    plt.colorbar(nodes, ax=ax, label='Number of Connections')
+    plt.title(f'Original Knowledge Graph (Detailed View)\n{clean_graph.number_of_nodes()} entities, {clean_graph.number_of_edges()} relationships',
+              fontsize=16, fontweight='bold')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+# Call it
+visualize_original_graph_detailed(index)
+
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
+def create_community_wordclouds(index):
+    """Create word clouds for each community summary."""
+    summaries = index.property_graph_store.get_community_summaries()
+    
+    n_communities = len(summaries)
+    cols = 3
+    rows = (n_communities + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(18, 6*rows))
+    axes = axes.flatten() if n_communities > 1 else [axes]
+    
+    for idx, (comm_id, summary) in enumerate(summaries.items()):
+        if idx >= len(axes):
+            break
+            
+        wordcloud = WordCloud(width=800, height=400, 
+                             background_color='white',
+                             max_words=50).generate(summary)
+        
+        axes[idx].imshow(wordcloud, interpolation='bilinear')
+        axes[idx].set_title(f'Community {comm_id}', fontsize=12, fontweight='bold')
+        axes[idx].axis('off')
+    
+    # Hide unused subplots
+    for idx in range(len(summaries), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+create_community_wordclouds(index)
+
+# Install: pip install wordcloud
