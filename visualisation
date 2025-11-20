@@ -1,0 +1,882 @@
+"""Visualization functions for GraphRAG knowledge graphs and communities."""
+
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import networkx as nx
+from wordcloud import WordCloud
+from graspologic.partition import hierarchical_leiden
+
+import numpy as np
+from collections import Counter
+import seaborn as sns
+from matplotlib.patches import FancyBboxPatch
+
+
+def visualize_community_graph(index):
+    """Visualize the simplified community graph."""
+    community_graph, community_nodes = index.property_graph_store.get_community_graph()
+
+    if community_graph.number_of_nodes() > 0:
+        # Create figure
+        fig, ax = plt.subplots(figsize=(20, 15))
+        
+        # Use spring layout for positioning
+        pos = nx.spring_layout(community_graph, k=2, iterations=50)
+        
+        # Get node sizes based on number of connections (degree)
+        node_sizes = [community_graph.degree(node) * 1000 + 2000 for node in community_graph.nodes()]
+        
+        # Color nodes by community ID (using a colormap)
+        node_colors = [hash(str(node)) % 256 for node in community_graph.nodes()]
+        cmap = cm.get_cmap('tab20')
+        colors = [cmap(i % 20) for i in range(len(node_colors))]
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(community_graph, pos, 
+                              node_color=colors,
+                              node_size=node_sizes,
+                              alpha=0.8,
+                              ax=ax)
+        
+        # Draw edges with thickness based on weight (number of connections)
+        edges = community_graph.edges()
+        edge_weights = [community_graph[u][v].get('weight', 1) for u, v in edges]
+        nx.draw_networkx_edges(community_graph, pos,
+                              width=[w * 0.5 for w in edge_weights],
+                              alpha=0.6,
+                              edge_color='gray',
+                              ax=ax)
+        
+        # Create labels with community summaries
+        labels = {}
+        for node in community_graph.nodes():
+            summary = community_nodes.get(node, f"Community {node}")
+            # Create multi-line label (first line: ID, second: summary)
+            labels[node] = f"C{node}\n{summary[:50]}..."
+        
+        nx.draw_networkx_labels(community_graph, pos, labels, 
+                               font_size=8, font_weight='bold', ax=ax)
+        
+        # Add edge labels showing relationship types
+        edge_labels = {}
+        for u, v, data in community_graph.edges(data=True):
+            relationships = data.get('relationships', [])
+            unique_rels = list(set(relationships))[:3]  # Show up to 3 unique relationship types
+            edge_labels[(u, v)] = f"{len(relationships)} links\n{', '.join(unique_rels)}"
+        
+        nx.draw_networkx_edge_labels(community_graph, pos, edge_labels, 
+                                    font_size=6, ax=ax)
+        
+        plt.title("Simplified Community Graph\n(Nodes = Communities, Edges = Inter-community connections)", 
+                  size=16, fontweight='bold')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+        
+        # Print statistics
+        print("\n" + "="*60)
+        print("COMMUNITY GRAPH STATISTICS")
+        print("="*60)
+        print(f"Number of communities: {community_graph.number_of_nodes()}")
+        print(f"Inter-community connections: {community_graph.number_of_edges()}")
+        print(f"\nCommunity Details:")
+        for node in sorted(community_graph.nodes()):
+            degree = community_graph.degree(node)
+            summary = community_nodes.get(node, "No summary")
+            print(f"\n  Community {node}:")
+            print(f"    Connections to other communities: {degree}")
+            print(f"    Summary: {summary[:10]}...")
+    else:
+        print("No communities found in the graph.")
+
+
+def visualize_hierarchical_communities(index, level_0_max_size=None, level_1_max_size=None):
+    """
+    Create side-by-side visualization of communities at two hierarchical levels.
+    Similar to the research paper figure.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    # Get communities at level 0 (coarse/root)
+    if level_0_max_size is None:
+        level_0_max_size = max(50, len(nx_graph.nodes()) // 5)
+    clusters_level_0 = hierarchical_leiden(nx_graph, max_cluster_size=level_0_max_size)
+    mapping_level_0 = {item.node: item.cluster for item in clusters_level_0}
+    
+    # Get communities at level 1 (finer)
+    if level_1_max_size is None:
+        level_1_max_size = index.property_graph_store.max_cluster_size
+    clusters_level_1 = hierarchical_leiden(nx_graph, max_cluster_size=level_1_max_size)
+    mapping_level_1 = {item.node: item.cluster for item in clusters_level_1}
+    
+    # Create figure with two subplots side by side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 12))
+    
+    # Use the same layout for both graphs for comparison
+    pos = nx.spring_layout(nx_graph, k=1, iterations=50, seed=42)
+    
+    # Get unique communities for coloring
+    communities_0 = set(mapping_level_0.values())
+    communities_1 = set(mapping_level_1.values())
+    
+    # Create color maps
+    cmap_0 = cm.get_cmap('tab20')
+    cmap_1 = cm.get_cmap('tab20')
+    colors_0 = {comm: cmap_0(i % 20) for i, comm in enumerate(communities_0)}
+    colors_1 = {comm: cmap_1(i % 20) for i, comm in enumerate(communities_1)}
+    
+    # Add fallback color for unmapped nodes
+    default_color = (0.5, 0.5, 0.5, 1.0)  # Gray
+    colors_0[-1] = default_color
+    colors_1[-1] = default_color
+    
+    # Plot Level 0 (Root communities) - Graph (a)
+    node_colors_0 = []
+    for node in nx_graph.nodes():
+        comm_id = mapping_level_0.get(node, -1)
+        node_colors_0.append(colors_0.get(comm_id, default_color))
+    
+    nx.draw_networkx_nodes(nx_graph, pos, 
+                          node_color=node_colors_0,
+                          node_size=50,
+                          alpha=0.8,
+                          ax=ax1,
+                          edgecolors='black',
+                          linewidths=0.5)
+    nx.draw_networkx_edges(nx_graph, pos,
+                          alpha=0.2,
+                          edge_color='gray',
+                          width=0.5,
+                          ax=ax1)
+    ax1.set_title(f'(a) Root communities at level 0\n({len(communities_0)} communities, max_size={level_0_max_size})', 
+                  fontsize=14, fontweight='bold', pad=20)
+    ax1.axis('off')
+    
+    # Plot Level 1 (Sub-communities) - Graph (b)
+    node_colors_1 = []
+    for node in nx_graph.nodes():
+        comm_id = mapping_level_1.get(node, -1)
+        node_colors_1.append(colors_1.get(comm_id, default_color))
+    
+    nx.draw_networkx_nodes(nx_graph, pos, 
+                          node_color=node_colors_1,
+                          node_size=50,
+                          alpha=0.8,
+                          ax=ax2,
+                          edgecolors='black',
+                          linewidths=0.5)
+    nx.draw_networkx_edges(nx_graph, pos,
+                          alpha=0.2,
+                          edge_color='gray',
+                          width=0.5,
+                          ax=ax2)
+    ax2.set_title(f'(b) Sub-communities at level 1\n({len(communities_1)} communities, max_size={level_1_max_size})', 
+                  fontsize=14, fontweight='bold', pad=20)
+    ax2.axis('off')
+    
+    plt.suptitle('Hierarchical Community Detection', fontsize=16, fontweight='bold', y=0.98)
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics
+    print("\n" + "="*60)
+    print("HIERARCHICAL COMMUNITY STATISTICS")
+    print("="*60)
+    print(f"\nLevel 0 (Root):")
+    print(f"  Number of communities: {len(communities_0)}")
+    print(f"  Average community size: {len(nx_graph.nodes()) / len(communities_0):.1f} nodes")
+    
+    print(f"\nLevel 1 (Sub-communities):")
+    print(f"  Number of communities: {len(communities_1)}")
+    print(f"  Average community size: {len(nx_graph.nodes()) / len(communities_1):.1f} nodes")
+    
+    # Show how level 0 communities are subdivided
+    print(f"\nCommunity Subdivision Analysis:")
+    comm_0_to_1 = {}
+    for node in nx_graph.nodes():
+        comm_0 = mapping_level_0.get(node)
+        comm_1 = mapping_level_1.get(node)
+        if comm_0 not in comm_0_to_1:
+            comm_0_to_1[comm_0] = set()
+        comm_0_to_1[comm_0].add(comm_1)
+    
+    # for comm_0, sub_comms in sorted(comm_0_to_1.items())[:5]:  # Show first 5
+    #     print(f"  Level 0 Community {comm_0} contains {len(sub_comms)} sub-communities at Level 1")
+
+
+def visualize_original_graph(index):
+    """
+    Visualize the original knowledge graph with all entities (nodes) and relationships (edges).
+    """
+    # Get the NetworkX graph from the index
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    if nx_graph.number_of_nodes() == 0:
+        print("Graph is empty - no nodes to visualize.")
+        return
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(20, 16))
+    
+    # Use a layout algorithm (spring layout works well for general graphs)
+    # Adjust k parameter for spacing (larger = more spread out)
+    pos = nx.spring_layout(nx_graph, k=2, iterations=50, seed=42)
+    
+    # Calculate node sizes based on degree (more connections = larger node)
+    degrees = dict(nx_graph.degree())
+    node_sizes = [degrees[node] * 300 + 200 for node in nx_graph.nodes()]
+    
+    # Color nodes by degree (more connected = darker)
+    node_colors = [degrees[node] for node in nx_graph.nodes()]
+    
+    # Draw nodes
+    nodes = nx.draw_networkx_nodes(
+        nx_graph, 
+        pos,
+        node_color=node_colors,
+        node_size=node_sizes,
+        cmap=plt.cm.viridis,  # Color map: darker = more connections
+        alpha=0.8,
+        edgecolors='black',
+        linewidths=1.5,
+        ax=ax
+    )
+    
+    # Draw edges
+    nx.draw_networkx_edges(
+        nx_graph,
+        pos,
+        alpha=0.3,
+        edge_color='gray',
+        width=1.0,
+        ax=ax
+    )
+    
+    # Draw node labels (entity names)
+    # Only show labels for nodes with high degree to avoid clutter
+    high_degree_nodes = {node: label for node, label in zip(nx_graph.nodes(), nx_graph.nodes()) 
+                         if degrees[node] >= 3}  # Only label nodes with 3+ connections
+    
+    if high_degree_nodes:
+        nx.draw_networkx_labels(
+            nx_graph,
+            pos,
+            labels=high_degree_nodes,
+            font_size=8,
+            font_weight='bold',
+            ax=ax
+        )
+    
+    # Add colorbar for node degree
+    plt.colorbar(nodes, ax=ax, label='Number of Connections (Degree)')
+    
+    plt.title(f'Original Knowledge Graph\n({nx_graph.number_of_nodes()} entities, {nx_graph.number_of_edges()} relationships)', 
+              fontsize=16, fontweight='bold', pad=20)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics
+    print("\n" + "="*60)
+    print("KNOWLEDGE GRAPH STATISTICS")
+    print("="*60)
+    print(f"Total entities (nodes): {nx_graph.number_of_nodes()}")
+    print(f"Total relationships (edges): {nx_graph.number_of_edges()}")
+    print(f"Average connections per entity: {sum(degrees.values()) / len(degrees):.2f}")
+    print(f"\nMost connected entities:")
+    sorted_degrees = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
+    for i, (node, degree) in enumerate(sorted_degrees[:10], 1):
+        print(f"  {i}. {node}: {degree} connections")
+    
+    return nx_graph
+
+
+def visualize_original_graph_detailed(index, max_nodes=100):
+    """
+    Visualize with relationship type labels and entity details.
+    If graph is too large, only show a subset.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    if nx_graph.number_of_nodes() == 0:
+        print("Graph is empty.")
+        return
+    
+    # If graph is too large, create a subgraph with most connected nodes
+    if nx_graph.number_of_nodes() > max_nodes:
+        print(f"Graph has {nx_graph.number_of_nodes()} nodes. Showing top {max_nodes} most connected nodes.")
+        degrees = dict(nx_graph.degree())
+        top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+        top_node_list = [node for node, _ in top_nodes]
+        nx_graph = nx_graph.subgraph(top_node_list)
+    
+    # Create mapping from node IDs to clean names
+    node_id_to_name = {}
+    for node_obj in index.property_graph_store.graph.nodes.values():
+        node_id = str(node_obj.id) if hasattr(node_obj, 'id') else str(node_obj)
+        node_name = node_obj.name if hasattr(node_obj, 'name') else str(node_obj)
+        node_id_to_name[node_id] = node_name
+    
+    # Create a new graph with clean node names
+    clean_graph = nx.Graph()
+    for node_id in nx_graph.nodes():
+        clean_name = node_id_to_name.get(node_id, node_id)
+        clean_graph.add_node(clean_name)
+    
+    # Add edges with clean labels
+    for u, v, data in nx_graph.edges(data=True):
+        u_clean = node_id_to_name.get(u, u)
+        v_clean = node_id_to_name.get(v, v)
+        rel_label = data.get('relationship', 'related_to')
+        clean_graph.add_edge(u_clean, v_clean, relationship=rel_label)
+    
+    fig, ax = plt.subplots(figsize=(24, 18))
+    
+    pos = nx.spring_layout(clean_graph, k=2, iterations=50, seed=42)
+    
+    # Node sizes and colors
+    degrees = dict(clean_graph.degree())
+    node_sizes = [degrees[node] * 400 + 300 for node in clean_graph.nodes()]
+    node_colors = [degrees[node] for node in clean_graph.nodes()]
+    
+    # Draw nodes
+    nodes = nx.draw_networkx_nodes(
+        clean_graph, pos,
+        node_color=node_colors,
+        node_size=node_sizes,
+        cmap=plt.cm.plasma,
+        alpha=0.9,
+        edgecolors='black',
+        linewidths=2,
+        ax=ax
+    )
+    
+    # Draw edges
+    nx.draw_networkx_edges(
+        clean_graph, pos,
+        alpha=0.4,
+        edge_color='gray',
+        width=1.5,
+        ax=ax
+    )
+    
+    # Add edge labels (relationship types) - only for a subset to avoid clutter
+    edge_labels = {}
+    for u, v, data in list(clean_graph.edges(data=True))[:50]:  # Show first 50 edges
+        rel = data.get('relationship', '')
+        if rel:
+            edge_labels[(u, v)] = rel[:15]  # Truncate long names
+    
+    nx.draw_networkx_edge_labels(
+        clean_graph, pos,
+        edge_labels=edge_labels,
+        font_size=6,
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
+        ax=ax
+    )
+    
+    # Add node labels (entity names)
+    nx.draw_networkx_labels(
+        clean_graph, pos,
+        font_size=7,
+        font_weight='bold',
+        ax=ax
+    )
+    
+    plt.colorbar(nodes, ax=ax, label='Number of Connections')
+    plt.title(f'Original Knowledge Graph (Detailed View)\n{clean_graph.number_of_nodes()} entities, {clean_graph.number_of_edges()} relationships',
+              fontsize=16, fontweight='bold')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def create_community_wordclouds(index):
+    """Create word clouds for each community summary."""
+    summaries = index.property_graph_store.get_community_summaries()
+    
+    n_communities = len(summaries)
+    cols = 3
+    rows = (n_communities + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(18, 6*rows))
+    axes = axes.flatten() if n_communities > 1 else [axes]
+    
+    for idx, (comm_id, summary) in enumerate(summaries.items()):
+        if idx >= len(axes):
+            break
+            
+        wordcloud = WordCloud(width=800, height=400, 
+                             background_color='white',
+                             max_words=50).generate(summary)
+        
+        axes[idx].imshow(wordcloud, interpolation='bilinear')
+        axes[idx].set_title(f'Community {comm_id}', fontsize=12, fontweight='bold')
+        axes[idx].axis('off')
+    
+    # Hide unused subplots
+    for idx in range(len(summaries), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_entity_network(index, entity_name, max_hops=2, figsize=(16, 12)):
+    """
+    Visualize the network around a specific entity.
+    Shows direct and indirect connections with relationship types.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    if entity_name not in nx_graph:
+        print(f"Entity '{entity_name}' not found in graph")
+        return
+    
+    # Get subgraph around the entity
+    if max_hops == 1:
+        neighbors = list(nx_graph.neighbors(entity_name))
+        subgraph_nodes = [entity_name] + neighbors
+    else:
+        # Get nodes within max_hops distance
+        subgraph_nodes = [entity_name]
+        current_level = {entity_name}
+        for _ in range(max_hops):
+            next_level = set()
+            for node in current_level:
+                next_level.update(nx_graph.neighbors(node))
+            subgraph_nodes.extend(next_level)
+            current_level = next_level
+        subgraph_nodes = list(set(subgraph_nodes))
+    
+    subgraph = nx_graph.subgraph(subgraph_nodes)
+    
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Layout
+    pos = nx.spring_layout(subgraph, k=1.5, iterations=50, seed=42)
+    
+    # Highlight the central entity
+    node_colors = ['#FF6B6B' if node == entity_name else '#4ECDC4' 
+                   for node in subgraph.nodes()]
+    node_sizes = [2000 if node == entity_name else 800 
+                  for node in subgraph.nodes()]
+    
+    # Draw edges with relationship labels
+    nx.draw_networkx_edges(subgraph, pos, alpha=0.3, edge_color='gray', ax=ax)
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(subgraph, pos, node_color=node_colors, 
+                          node_size=node_sizes, alpha=0.9, ax=ax)
+    
+    # Add labels
+    labels = {node: node if len(node) < 20 else node[:17] + '...' 
+              for node in subgraph.nodes()}
+    nx.draw_networkx_labels(subgraph, pos, labels, font_size=9, 
+                           font_weight='bold', ax=ax)
+    
+    # Add relationship type labels on edges
+    edge_labels = {}
+    for u, v, data in subgraph.edges(data=True):
+        rel = data.get('relationship', 'unknown')
+        if len(rel) > 15:
+            rel = rel[:12] + '...'
+        edge_labels[(u, v)] = rel
+    
+    nx.draw_networkx_edge_labels(subgraph, pos, edge_labels, 
+                                 font_size=7, ax=ax, 
+                                 bbox=dict(boxstyle='round,pad=0.3', 
+                                          facecolor='white', alpha=0.7))
+    
+    plt.title(f"Network around '{entity_name}'\n({len(subgraph.nodes())} nodes, {len(subgraph.edges())} edges)", 
+              fontsize=16, fontweight='bold', pad=20)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    return subgraph
+
+
+def visualize_community_statistics(index):
+    """
+    Create a dashboard of community statistics with multiple charts.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    summaries = index.property_graph_store.get_community_summaries()
+    
+    # Get community assignments
+    from graspologic.partition import hierarchical_leiden
+    clusters = hierarchical_leiden(nx_graph, 
+                                   max_cluster_size=index.property_graph_store.max_cluster_size)
+    final_clusters = [item for item in clusters if item.is_final_cluster]
+    if not final_clusters:
+        max_level = max(item.level for item in clusters)
+        final_clusters = [item for item in clusters if item.level == max_level]
+    
+    community_mapping = {item.node: item.cluster for item in final_clusters}
+    
+    # Count nodes per community
+    community_sizes = Counter(community_mapping.values())
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(20, 12))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    
+    # 1. Community size distribution (bar chart)
+    ax1 = fig.add_subplot(gs[0, 0])
+    sizes = sorted(community_sizes.values(), reverse=True)
+    ax1.bar(range(len(sizes)), sizes, color='steelblue', alpha=0.7)
+    ax1.set_xlabel('Community Rank', fontsize=12)
+    ax1.set_ylabel('Number of Nodes', fontsize=12)
+    ax1.set_title('Community Size Distribution', fontsize=14, fontweight='bold')
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # 2. Community size pie chart
+    ax2 = fig.add_subplot(gs[0, 1])
+    top_communities = dict(sorted(community_sizes.items(), 
+                                  key=lambda x: x[1], reverse=True)[:10])
+    ax2.pie(top_communities.values(), labels=[f'C{k}' for k in top_communities.keys()],
+           autopct='%1.1f%%', startangle=90)
+    ax2.set_title('Top 10 Communities by Size', fontsize=14, fontweight='bold')
+    
+    # 3. Summary length distribution
+    ax3 = fig.add_subplot(gs[0, 2])
+    summary_lengths = [len(s) for s in summaries.values()]
+    ax3.hist(summary_lengths, bins=20, color='coral', alpha=0.7, edgecolor='black')
+    ax3.set_xlabel('Summary Length (characters)', fontsize=12)
+    ax3.set_ylabel('Frequency', fontsize=12)
+    ax3.set_title('Community Summary Length Distribution', fontsize=14, fontweight='bold')
+    ax3.grid(axis='y', alpha=0.3)
+    
+    # 4. Relationship type distribution
+    ax4 = fig.add_subplot(gs[1, :2])
+    relationship_types = []
+    for u, v, data in nx_graph.edges(data=True):
+        rel = data.get('relationship', 'unknown')
+        relationship_types.append(rel)
+    
+    rel_counts = Counter(relationship_types)
+    top_rels = dict(sorted(rel_counts.items(), key=lambda x: x[1], reverse=True)[:15])
+    
+    ax4.barh(range(len(top_rels)), list(top_rels.values()), color='mediumseagreen', alpha=0.7)
+    ax4.set_yticks(range(len(top_rels)))
+    ax4.set_yticklabels(list(top_rels.keys()))
+    ax4.set_xlabel('Frequency', fontsize=12)
+    ax4.set_title('Top 15 Relationship Types', fontsize=14, fontweight='bold')
+    ax4.grid(axis='x', alpha=0.3)
+    
+    # 5. Statistics text
+    ax5 = fig.add_subplot(gs[1, 2])
+    ax5.axis('off')
+    
+    stats_text = f"""
+    GRAPH STATISTICS
+    {'='*40}
+    Total Nodes: {nx_graph.number_of_nodes()}
+    Total Edges: {nx_graph.number_of_edges()}
+    Communities: {len(community_sizes)}
+    
+    COMMUNITY STATS
+    {'='*40}
+    Avg Size: {np.mean(list(community_sizes.values())):.1f}
+    Max Size: {max(community_sizes.values())}
+    Min Size: {min(community_sizes.values())}
+    
+    RELATIONSHIP STATS
+    {'='*40}
+    Unique Types: {len(rel_counts)}
+    Most Common: {rel_counts.most_common(1)[0][0]}
+    """
+    
+    ax5.text(0.1, 0.5, stats_text, fontsize=11, family='monospace',
+            verticalalignment='center', bbox=dict(boxstyle='round', 
+            facecolor='wheat', alpha=0.5))
+    
+    plt.suptitle('GraphRAG Community Statistics Dashboard', 
+                fontsize=18, fontweight='bold', y=0.98)
+    plt.show()
+
+
+def visualize_query_trace(index, query_engine, query_str):
+    """
+    Visualize which communities contributed to answering a query.
+    """
+    from graphrag.query_engine import GraphRAGQueryEngine
+    
+    if not hasattr(query_engine, 'query_with_trace'):
+        print("Query engine doesn't support tracing. Use query_with_trace method.")
+        return
+    
+    trace = query_engine.query_with_trace(query_str)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+    
+    # Left: Contributing communities
+    contributing = trace['contributing_communities']
+    non_contributing = [c for c in trace['all_communities'] if not c['contributed']]
+    
+    # Bar chart of contribution
+    comm_ids = [c['community_id'] for c in contributing]
+    answer_lengths = [len(c['answer']) for c in contributing]
+    
+    colors = ['#2ecc71' if c['contributed'] else '#e74c3c' 
+              for c in trace['all_communities']]
+    
+    ax1.barh(range(len(comm_ids)), answer_lengths, color='#2ecc71', alpha=0.7)
+    ax1.set_yticks(range(len(comm_ids)))
+    ax1.set_yticklabels([f'Community {cid}' for cid in comm_ids])
+    ax1.set_xlabel('Answer Length', fontsize=12)
+    ax1.set_title(f'Contributing Communities\n({len(contributing)}/{trace["total_communities"]} contributed)', 
+                 fontsize=14, fontweight='bold')
+    ax1.grid(axis='x', alpha=0.3)
+    
+    # Right: Summary of contributions
+    ax2.axis('off')
+    
+    summary_text = f"""
+    QUERY: {query_str}
+    {'='*60}
+    
+    FINAL ANSWER:
+    {trace['answer'][:500]}...
+    
+    CONTRIBUTING COMMUNITIES: {trace['num_contributing']}
+    {'='*60}
+    """
+    
+    for i, comm in enumerate(contributing[:5], 1):  # Show top 5
+        summary_text += f"\n[{i}] Community {comm['community_id']}:\n"
+        summary_text += f"    Answer: {comm['answer'][:100]}...\n"
+    
+    ax2.text(0.05, 0.95, summary_text, fontsize=10, family='monospace',
+            verticalalignment='top', transform=ax2.transAxes,
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+    
+    plt.suptitle('Query Trace Visualization', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    
+    return trace
+
+
+def visualize_relationship_types_network(index, top_n=10):
+    """
+    Visualize the graph colored by relationship types.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    
+    # Get most common relationship types
+    relationship_types = []
+    for u, v, data in nx_graph.edges(data=True):
+        rel = data.get('relationship', 'unknown')
+        relationship_types.append((u, v, rel))
+    
+    rel_counts = Counter([r[2] for r in relationship_types])
+    top_rels = [rel for rel, _ in rel_counts.most_common(top_n)]
+    
+    # Create subgraph with edges of top relationship types
+    edges_to_show = [(u, v) for u, v, r in relationship_types if r in top_rels]
+    nodes_to_show = set()
+    for u, v in edges_to_show:
+        nodes_to_show.add(u)
+        nodes_to_show.add(v)
+    
+    subgraph = nx_graph.subgraph(list(nodes_to_show))
+    
+    fig, ax = plt.subplots(figsize=(20, 16))
+    
+    pos = nx.spring_layout(subgraph, k=2, iterations=50, seed=42)
+    
+    # Color edges by relationship type
+    edge_colors = []
+    for u, v in subgraph.edges():
+        rel = subgraph[u][v].get('relationship', 'unknown')
+        if rel in top_rels:
+            edge_colors.append(top_rels.index(rel))
+        else:
+            edge_colors.append(len(top_rels))
+    
+    cmap = plt.cm.get_cmap('tab20')
+    edge_colors_mapped = [cmap(c % 20) for c in edge_colors]
+    
+    # Draw
+    nx.draw_networkx_edges(subgraph, pos, edge_color=edge_colors_mapped, 
+                          alpha=0.6, width=1.5, ax=ax)
+    nx.draw_networkx_nodes(subgraph, pos, node_color='lightblue', 
+                          node_size=500, alpha=0.8, ax=ax)
+    
+    # Labels for high-degree nodes
+    degrees = dict(subgraph.degree())
+    high_degree = {n: n for n in subgraph.nodes() if degrees[n] >= 3}
+    nx.draw_networkx_labels(subgraph, pos, high_degree, font_size=8, ax=ax)
+    
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=cmap(i % 20), label=rel) 
+                      for i, rel in enumerate(top_rels)]
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=9)
+    
+    plt.title(f'Knowledge Graph by Relationship Types\n(Top {top_n} relationship types)', 
+             fontsize=16, fontweight='bold')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_community_comparison(index, community_ids=None, max_entities=20):
+    """
+    Compare multiple communities side by side.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    summaries = index.property_graph_store.get_community_summaries()
+    
+    from graspologic.partition import hierarchical_leiden
+    clusters = hierarchical_leiden(nx_graph, 
+                                   max_cluster_size=index.property_graph_store.max_cluster_size)
+    final_clusters = [item for item in clusters if item.is_final_cluster]
+    if not final_clusters:
+        max_level = max(item.level for item in clusters)
+        final_clusters = [item for item in clusters if item.level == max_level]
+    
+    community_mapping = {item.node: item.cluster for item in final_clusters}
+    
+    if community_ids is None:
+        # Show top communities by size
+        community_sizes = Counter(community_mapping.values())
+        community_ids = [cid for cid, _ in community_sizes.most_common(4)]
+    
+    n_communities = len(community_ids)
+    fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+    axes = axes.flatten()
+    
+    for idx, comm_id in enumerate(community_ids[:4]):
+        ax = axes[idx]
+        
+        # Get nodes in this community
+        comm_nodes = [node for node, cid in community_mapping.items() if cid == comm_id]
+        
+        # Create subgraph
+        subgraph = nx_graph.subgraph(comm_nodes[:max_entities])
+        
+        if subgraph.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, f'Community {comm_id}\nNo nodes', 
+                   ha='center', va='center', fontsize=14)
+            ax.axis('off')
+            continue
+        
+        pos = nx.spring_layout(subgraph, k=1, iterations=50, seed=42)
+        
+        # Draw
+        nx.draw_networkx_edges(subgraph, pos, alpha=0.3, ax=ax)
+        nx.draw_networkx_nodes(subgraph, pos, node_color=f'C{idx}', 
+                              node_size=800, alpha=0.8, ax=ax)
+        nx.draw_networkx_labels(subgraph, pos, font_size=7, ax=ax)
+        
+        summary = summaries.get(comm_id, 'No summary')
+        ax.set_title(f'Community {comm_id}\n({len(comm_nodes)} nodes)\n{summary[:80]}...', 
+                    fontsize=12, fontweight='bold')
+        ax.axis('off')
+    
+    plt.suptitle('Community Comparison', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+
+def create_graph_dashboard(index):
+    """
+    Create a comprehensive dashboard with multiple visualizations.
+    """
+    nx_graph = index.property_graph_store._create_nx_graph()
+    summaries = index.property_graph_store.get_community_summaries()
+    
+    fig = plt.figure(figsize=(24, 16))
+    gs = fig.add_gridspec(3, 3, hspace=0.4, wspace=0.4)
+    
+    # 1. Main graph visualization (top left, spans 2 columns)
+    ax1 = fig.add_subplot(gs[0, :2])
+    pos = nx.spring_layout(nx_graph, k=1, iterations=30, seed=42)
+    degrees = dict(nx_graph.degree())
+    node_sizes = [degrees[n] * 100 + 100 for n in nx_graph.nodes()]
+    node_colors = [degrees[n] for n in nx_graph.nodes()]
+    
+    nx.draw_networkx_edges(nx_graph, pos, alpha=0.2, ax=ax1)
+    nodes = nx.draw_networkx_nodes(nx_graph, pos, node_color=node_colors,
+                                   node_size=node_sizes, cmap=plt.cm.viridis,
+                                   alpha=0.8, ax=ax1)
+    plt.colorbar(nodes, ax=ax1, label='Degree')
+    ax1.set_title('Knowledge Graph Overview', fontsize=14, fontweight='bold')
+    ax1.axis('off')
+    
+    # 2. Degree distribution
+    ax2 = fig.add_subplot(gs[0, 2])
+    degree_values = list(degrees.values())
+    ax2.hist(degree_values, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+    ax2.set_xlabel('Node Degree', fontsize=10)
+    ax2.set_ylabel('Frequency', fontsize=10)
+    ax2.set_title('Degree Distribution', fontsize=12, fontweight='bold')
+    ax2.grid(alpha=0.3)
+    
+    # 3. Community sizes
+    ax3 = fig.add_subplot(gs[1, 0])
+    from graspologic.partition import hierarchical_leiden
+    clusters = hierarchical_leiden(nx_graph, 
+                                   max_cluster_size=index.property_graph_store.max_cluster_size)
+    final_clusters = [item for item in clusters if item.is_final_cluster]
+    if not final_clusters:
+        max_level = max(item.level for item in clusters)
+        final_clusters = [item for item in clusters if item.level == max_level]
+    community_mapping = {item.node: item.cluster for item in final_clusters}
+    community_sizes = Counter(community_mapping.values())
+    sizes = sorted(community_sizes.values(), reverse=True)
+    ax3.bar(range(len(sizes)), sizes, color='coral', alpha=0.7)
+    ax3.set_xlabel('Community', fontsize=10)
+    ax3.set_ylabel('Size', fontsize=10)
+    ax3.set_title('Community Sizes', fontsize=12, fontweight='bold')
+    ax3.grid(axis='y', alpha=0.3)
+    
+    # 4. Relationship types
+    ax4 = fig.add_subplot(gs[1, 1])
+    rel_types = [data.get('relationship', 'unknown') 
+                for _, _, data in nx_graph.edges(data=True)]
+    rel_counts = Counter(rel_types)
+    top_10 = dict(sorted(rel_counts.items(), key=lambda x: x[1], reverse=True)[:10])
+    ax4.barh(range(len(top_10)), list(top_10.values()), color='mediumseagreen', alpha=0.7)
+    ax4.set_yticks(range(len(top_10)))
+    ax4.set_yticklabels(list(top_10.keys()), fontsize=8)
+    ax4.set_xlabel('Count', fontsize=10)
+    ax4.set_title('Top 10 Relationship Types', fontsize=12, fontweight='bold')
+    ax4.grid(axis='x', alpha=0.3)
+    
+    # 5. Summary statistics
+    ax5 = fig.add_subplot(gs[1, 2])
+    ax5.axis('off')
+    stats = f"""
+    GRAPH METRICS
+    {'='*30}
+    Nodes: {nx_graph.number_of_nodes()}
+    Edges: {nx_graph.number_of_edges()}
+    Communities: {len(community_sizes)}
+    Avg Degree: {np.mean(degree_values):.1f}
+    
+    DENSITY
+    {'='*30}
+    {nx.density(nx_graph):.4f}
+    """
+    ax5.text(0.1, 0.5, stats, fontsize=11, family='monospace',
+            verticalalignment='center', transform=ax5.transAxes,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # 6. Community summaries word cloud (bottom)
+    ax6 = fig.add_subplot(gs[2, :])
+    all_summaries = ' '.join(summaries.values())
+    if all_summaries:
+        wordcloud = WordCloud(width=1600, height=400, background_color='white',
+                             max_words=100).generate(all_summaries)
+        ax6.imshow(wordcloud, interpolation='bilinear')
+        ax6.axis('off')
+        ax6.set_title('Combined Community Summaries Word Cloud', 
+                     fontsize=14, fontweight='bold')
+    
+    plt.suptitle('GraphRAG Comprehensive Dashboard', fontsize=18, fontweight='bold', y=0.98)
+    plt.show()
+
