@@ -391,10 +391,10 @@ def visualize_original_graph_detailed(index, max_nodes=100):
     plt.show()
 
 
-def create_community_wordclouds(index):
+def create_community_wordclouds(index, community_number):
     """Create word clouds for each community summary."""
     summaries = index.property_graph_store.get_community_summaries()
-    
+    summaries = [summaries[i] for i in community_number if i < len(summaries)]
     n_communities = len(summaries)
     cols = 3
     rows = (n_communities + cols - 1) // cols
@@ -402,7 +402,7 @@ def create_community_wordclouds(index):
     fig, axes = plt.subplots(rows, cols, figsize=(18, 6*rows))
     axes = axes.flatten() if n_communities > 1 else [axes]
     
-    for idx, (comm_id, summary) in enumerate(summaries.items()):
+    for idx, summary in enumerate(summaries):
         if idx >= len(axes):
             break
             
@@ -411,7 +411,7 @@ def create_community_wordclouds(index):
                              max_words=50).generate(summary)
         
         axes[idx].imshow(wordcloud, interpolation='bilinear')
-        axes[idx].set_title(f'Community {comm_id}', fontsize=12, fontweight='bold')
+        axes[idx].set_title(f'Community {community_number[idx]}', fontsize=12, fontweight='bold')
         axes[idx].axis('off')
     
     # Hide unused subplots
@@ -879,4 +879,490 @@ def create_graph_dashboard(index):
     
     plt.suptitle('GraphRAG Comprehensive Dashboard', fontsize=18, fontweight='bold', y=0.98)
     plt.show()
+
+def visualize_node_relationship(index, entity1, entity2, show_neighbors=True, max_neighbors=5):
+    """
+    Visualize the relationship between two specific nodes in the graph.
+    
+    Args:
+        index: Your PropertyGraphIndex
+        entity1: First entity name
+        entity2: Second entity name
+        show_neighbors: Whether to show immediate neighbors for context
+        max_neighbors: Maximum number of neighbors to show for each entity
+    """
+    import networkx as nx
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    
+    graph_store = index.property_graph_store
+    nx_graph = graph_store._create_nx_graph()
+    
+    # Find entities
+    found1 = None
+    found2 = None
+    
+    for node in nx_graph.nodes():
+        if entity1.lower() in str(node).lower():
+            found1 = node
+        if entity2.lower() in str(node).lower():
+            found2 = node
+    
+    if found1 is None:
+        print(f"Entity '{entity1}' not found in graph")
+        return None
+    
+    if found2 is None:
+        print(f"Entity '{entity2}' not found in graph")
+        return None
+    
+    print(f"\n{'='*80}")
+    print(f"VISUALIZING RELATIONSHIP: {found1} ↔ {found2}")
+    print(f"{'='*80}\n")
+    
+    # Check if directly connected
+    is_direct = nx_graph.has_edge(found1, found2) or nx_graph.has_edge(found2, found1)
+    
+    if is_direct:
+        edge_data = nx_graph.get_edge_data(found1, found2) or nx_graph.get_edge_data(found2, found1)
+        print(f"✓ DIRECTLY CONNECTED")
+        print(f"  Relationship: {edge_data.get('relationship', 'unknown')}")
+        print(f"  Description: {edge_data.get('description', 'No description')}\n")
+    else:
+        print(f"✗ NOT DIRECTLY CONNECTED\n")
+        # Check for path
+        try:
+            if nx.has_path(nx_graph, found1, found2):
+                path = nx.shortest_path(nx_graph, found1, found2)
+                print(f"✓ CONNECTED VIA PATH (length: {len(path)-1} hops)")
+                print(f"  Path: {' → '.join(path)}\n")
+            else:
+                print(f"✗ NOT CONNECTED AT ALL\n")
+        except:
+            pass
+    
+    # Create subgraph
+    if show_neighbors:
+        # Include immediate neighbors for context
+        neighbors1 = list(nx_graph.neighbors(found1))[:max_neighbors]
+        neighbors2 = list(nx_graph.neighbors(found2))[:max_neighbors]
+        all_nodes = [found1, found2] + neighbors1 + neighbors2
+        subgraph = nx_graph.subgraph(list(set(all_nodes)))
+    else:
+        # Just the two nodes and their connection
+        if is_direct:
+            subgraph = nx_graph.subgraph([found1, found2])
+        else:
+            # Show path if exists
+            try:
+                if nx.has_path(nx_graph, found1, found2):
+                    path = nx.shortest_path(nx_graph, found1, found2)
+                    subgraph = nx_graph.subgraph(path)
+                else:
+                    subgraph = nx_graph.subgraph([found1, found2])
+            except:
+                subgraph = nx_graph.subgraph([found1, found2])
+    
+    # Create visualization
+    fig, ax = plt.subplots(figsize=(18, 14))
+    
+    # Layout
+    pos = nx.spring_layout(subgraph, k=2.5, iterations=50, seed=42)
+    
+    # Node colors and sizes
+    node_colors = []
+    node_sizes = []
+    node_labels = {}
+    
+    for node in subgraph.nodes():
+        if node == found1:
+            node_colors.append('#FF6B6B')  # Red for entity1
+            node_sizes.append(4000)
+            node_labels[node] = f"{node}\n(Entity 1)"
+        elif node == found2:
+            node_colors.append('#4ECDC4')  # Teal for entity2
+            node_sizes.append(4000)
+            node_labels[node] = f"{node}\n(Entity 2)"
+        else:
+            node_colors.append('#E8E8E8')  # Gray for neighbors
+            node_sizes.append(1200)
+            node_labels[node] = str(node)[:20] + '...' if len(str(node)) > 20 else str(node)
+    
+    # Draw all edges
+    nx.draw_networkx_edges(subgraph, pos, 
+                          alpha=0.3, 
+                          edge_color='gray',
+                          width=1.5,
+                          ax=ax)
+    
+    # Highlight the connection between the two entities
+    if is_direct:
+        nx.draw_networkx_edges(subgraph, pos,
+                              edgelist=[(found1, found2)],
+                              edge_color='red',
+                              width=6,
+                              alpha=0.8,
+                              style='dashed',
+                              ax=ax)
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(subgraph, pos,
+                          node_color=node_colors,
+                          node_size=node_sizes,
+                          alpha=0.9,
+                          edgecolors='black',
+                          linewidths=3,
+                          ax=ax)
+    
+    # Draw labels
+    nx.draw_networkx_labels(subgraph, pos,
+                           labels=node_labels,
+                           font_size=9,
+                           font_weight='bold',
+                           ax=ax)
+    
+    # Add relationship label if directly connected
+    if is_direct:
+        edge_data = nx_graph.get_edge_data(found1, found2) or nx_graph.get_edge_data(found2, found1)
+        rel_type = edge_data.get('relationship', 'unknown')
+        rel_desc = edge_data.get('description', '')
+        
+        # Truncate description
+        if len(rel_desc) > 60:
+            rel_desc = rel_desc[:57] + '...'
+        
+        edge_label = f"{rel_type}\n{rel_desc}"
+        
+        nx.draw_networkx_edge_labels(subgraph, pos,
+                                    {(found1, found2): edge_label},
+                                    font_size=10,
+                                    font_color='red',
+                                    font_weight='bold',
+                                    ax=ax,
+                                    bbox=dict(boxstyle='round,pad=1.0',
+                                            facecolor='yellow',
+                                            edgecolor='red',
+                                            linewidth=2,
+                                            alpha=0.9))
+    
+    # Add path labels if not directly connected
+    if not is_direct:
+        try:
+            if nx.has_path(nx_graph, found1, found2):
+                path = nx.shortest_path(nx_graph, found1, found2)
+                path_edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
+                
+                # Highlight path
+                nx.draw_networkx_edges(subgraph, pos,
+                                      edgelist=path_edges,
+                                      edge_color='blue',
+                                      width=4,
+                                      alpha=0.6,
+                                      style='dashed',
+                                      ax=ax)
+                
+                # Add path labels
+                path_labels = {}
+                for i in range(len(path)-1):
+                    edge_data = nx_graph.get_edge_data(path[i], path[i+1])
+                    rel = edge_data.get('relationship', 'unknown') if edge_data else 'unknown'
+                    path_labels[(path[i], path[i+1])] = rel
+                
+                nx.draw_networkx_edge_labels(subgraph, pos,
+                                            path_labels,
+                                            font_size=8,
+                                            font_color='blue',
+                                            ax=ax,
+                                            bbox=dict(boxstyle='round,pad=0.5',
+                                                    facecolor='lightblue',
+                                                    alpha=0.7))
+        except:
+            pass
+    
+    # Legend
+    legend_elements = [
+        mpatches.Patch(facecolor='#FF6B6B', label=f'Entity 1: {found1}'),
+        mpatches.Patch(facecolor='#4ECDC4', label=f'Entity 2: {found2}'),
+        mpatches.Patch(facecolor='#E8E8E8', label='Neighbors'),
+    ]
+    
+    if is_direct:
+        from matplotlib.lines import Line2D
+        legend_elements.append(
+            Line2D([0], [0], color='red', linewidth=4, linestyle='--', 
+                  label='Direct Connection')
+        )
+    
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10)
+    
+    # Title
+    title = f"Relationship: {found1} ↔ {found2}"
+    if is_direct:
+        edge_data = nx_graph.get_edge_data(found1, found2) or nx_graph.get_edge_data(found2, found1)
+        title += f"\nType: {edge_data.get('relationship', 'unknown')}"
+    else:
+        title += "\n(Not directly connected)"
+    
+    plt.title(title, fontsize=16, fontweight='bold', pad=20)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    # Print detailed information
+    print(f"{'='*80}")
+    print(f"DETAILED INFORMATION")
+    print(f"{'='*80}\n")
+    
+    if is_direct:
+        edge_data = nx_graph.get_edge_data(found1, found2) or nx_graph.get_edge_data(found2, found1)
+        print(f"From: {found1}")
+        print(f"To: {found2}")
+        print(f"Relationship Type: {edge_data.get('relationship', 'unknown')}")
+        print(f"Description: {edge_data.get('description', 'No description')}")
+    else:
+        try:
+            if nx.has_path(nx_graph, found1, found2):
+                path = nx.shortest_path(nx_graph, found1, found2)
+                print(f"Path from {found1} to {found2} ({len(path)-1} hops):\n")
+                for i in range(len(path)-1):
+                    edge_data = nx_graph.get_edge_data(path[i], path[i+1])
+                    if edge_data:
+                        print(f"  {i+1}. {path[i]} → {path[i+1]}")
+                        print(f"     Relationship: {edge_data.get('relationship', 'unknown')}")
+                        print(f"     Description: {edge_data.get('description', 'No description')}\n")
+        except:
+            print("No path found between the entities")
+    
+    # Show neighbors
+    if show_neighbors:
+        print(f"\n{'='*80}")
+        print(f"NEIGHBORS FOR CONTEXT")
+        print(f"{'='*80}\n")
+        
+        neighbors1 = list(nx_graph.neighbors(found1))
+        neighbors2 = list(nx_graph.neighbors(found2))
+        
+        print(f"{found1} has {len(neighbors1)} connections")
+        if found2 in neighbors1:
+            print(f"  ✓ Includes {found2}")
+        print(f"\n{found2} has {len(neighbors2)} connections")
+        if found1 in neighbors2:
+            print(f"  ✓ Includes {found1}")
+        
+        common = set(neighbors1) & set(neighbors2)
+        if common:
+            print(f"\nCommon neighbors: {len(common)}")
+            for neighbor in sorted(common):
+                print(f"  • {neighbor}")
+
+
+def visualize_community_relationships(index, community_ids, max_nodes_per_comm=30):
+    """
+    Visualize relationships within one or more communities with improved layout.
+    
+    Args:
+        index: Your PropertyGraphIndex
+        community_ids: Single community ID (int) or list of community IDs
+        show_text: Whether to print relationship details (default: True)
+        max_nodes_per_comm: Maximum nodes to show per community (default: 30)
+    """
+    import networkx as nx
+    import matplotlib.pyplot as plt
+    from graspologic.partition import hierarchical_leiden
+    from collections import defaultdict
+    
+    # Convert single ID to list
+    if isinstance(community_ids, int):
+        community_ids = [community_ids]
+    
+    graph_store = index.property_graph_store
+    nx_graph = graph_store._create_nx_graph()
+    
+    # Get communities
+    clusters = hierarchical_leiden(nx_graph, max_cluster_size=graph_store.max_cluster_size)
+    final_clusters = [item for item in clusters if item.is_final_cluster]
+    if not final_clusters:
+        max_level = max(item.level for item in clusters)
+        final_clusters = [item for item in clusters if item.level == max_level]
+    
+    community_mapping = {item.node: item.cluster for item in final_clusters}
+    
+    # Prepare data for each community
+    communities_data = []
+    
+    for comm_id in community_ids:
+        community_nodes = [node for node, cid in community_mapping.items() if cid == comm_id]
+        
+        if not community_nodes:
+            print(f"Warning: Community {comm_id} not found")
+            continue
+        
+        # Limit nodes if too many
+        if len(community_nodes) > max_nodes_per_comm:
+            # Keep most connected nodes
+            degrees = {node: nx_graph.degree(node) for node in community_nodes}
+            top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:max_nodes_per_comm]
+            community_nodes = [node for node, _ in top_nodes]
+            print(f"Community {comm_id}: Showing top {max_nodes_per_comm} of {len(community_mapping)} nodes")
+        
+        # Get relationships within this community
+        relationships = []
+        for node in community_nodes:
+            neighbors = list(nx_graph.neighbors(node))
+            for neighbor in neighbors:
+                if neighbor in community_nodes:
+                    edge_data = nx_graph.get_edge_data(node, neighbor)
+                    if edge_data:
+                        relationships.append((node, neighbor, edge_data))
+        
+        communities_data.append({
+            'id': comm_id,
+            'nodes': community_nodes,
+            'relationships': relationships
+        })
+    
+    if not communities_data:
+        print("No valid communities found")
+        return
+    
+    n_communities = len(communities_data)
+    
+    # Calculate grid layout
+    if n_communities == 1:
+        rows, cols = 1, 1
+        figsize = (12, 10)
+    elif n_communities == 2:
+        rows, cols = 1, 2
+        figsize = (20, 8)
+    elif n_communities <= 4:
+        rows, cols = 2, 2
+        figsize = (18, 16)
+    elif n_communities <= 6:
+        rows, cols = 2, 3
+        figsize = (24, 16)
+    else:
+        rows, cols = 3, 3
+        figsize = (24, 20)
+        communities_data = communities_data[:9]  # Limit to 9
+    
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    
+    # Handle single subplot
+    if n_communities == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    # Get all unique relationship types for consistent coloring
+    all_rel_types = set()
+    for comm_data in communities_data:
+        for _, _, data in comm_data['relationships']:
+            all_rel_types.add(data.get('relationship', 'unknown'))
+    all_rel_types = sorted(list(all_rel_types))
+    cmap = plt.cm.get_cmap('tab20')
+    rel_color_map = {rel: cmap(i % 20) for i, rel in enumerate(all_rel_types)}
+    
+    # Visualize each community
+    for idx, comm_data in enumerate(communities_data):
+        ax = axes[idx]
+        comm_id = comm_data['id']
+        community_nodes = comm_data['nodes']
+        relationships = comm_data['relationships']
+        
+        # Create subgraph
+        subgraph = nx_graph.subgraph(community_nodes)
+        
+        if subgraph.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, f'Community {comm_id}\nNo nodes', 
+                   ha='center', va='center', fontsize=12, transform=ax.transAxes)
+            ax.axis('off')
+            continue
+        
+        # Layout
+        try:
+            pos = nx.spring_layout(subgraph, k=1.5, iterations=50, seed=42)
+        except:
+            pos = nx.spring_layout(subgraph, k=1, iterations=30)
+        
+        # Color edges by relationship type
+        edge_colors = []
+        edge_list = []
+        for u, v, data in relationships:
+            rel = data.get('relationship', 'unknown')
+            edge_colors.append(rel_color_map.get(rel, 'gray'))
+            edge_list.append((u, v))
+        
+        # Draw edges
+        if edge_list:
+            nx.draw_networkx_edges(subgraph, pos,
+                                  edgelist=edge_list,
+                                  edge_color=edge_colors,
+                                  width=2.0,
+                                  alpha=0.6,
+                                  ax=ax)
+        
+        # Draw nodes
+        node_sizes = [2000 if subgraph.degree(node) >= 3 else 1200 
+                     for node in subgraph.nodes()]
+        
+        nx.draw_networkx_nodes(subgraph, pos,
+                              node_color='lightblue',
+                              node_size=node_sizes,
+                              alpha=0.9,
+                              edgecolors='black',
+                              linewidths=1.5,
+                              ax=ax)
+        
+        # Labels
+        labels = {}
+        for node in subgraph.nodes():
+            label = str(node)
+            if len(label) > 12:
+                label = label[:9] + '...'
+            labels[node] = label
+        
+        nx.draw_networkx_labels(subgraph, pos, labels,
+                               font_size=6,
+                               font_weight='bold',
+                               ax=ax)
+        
+        # Edge labels (show relationship types for a few edges)
+        edge_labels = {}
+        for u, v, data in relationships[:8]:  # Show first 8
+            rel = data.get('relationship', 'unknown')
+            if len(rel) > 10:
+                rel = rel[:7] + '...'
+            edge_labels[(u, v)] = rel
+        
+        if edge_labels:
+            nx.draw_networkx_edge_labels(subgraph, pos, edge_labels,
+                                         font_size=5,
+                                         ax=ax,
+                                         bbox=dict(boxstyle='round,pad=0.2',
+                                                  facecolor='white',
+                                                  alpha=0.7))
+        
+        # Title with summary
+        summaries = graph_store.get_community_summaries()
+        summary = summaries.get(comm_id, '')
+        
+        title = f"Community {comm_id}\n"
+        title += f"{len(community_nodes)} nodes, {len(relationships)} rels"
+        
+        ax.set_title(title, fontsize=9, fontweight='bold', pad=10)
+        ax.axis('off')
+    
+    # Hide unused subplots
+    for idx in range(len(communities_data), len(axes)):
+        axes[idx].axis('off')
+    
+    # Overall title
+    if n_communities > 1:
+        plt.suptitle(f'Community Relationships Comparison', 
+                    fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout()
+    plt.show()
+    
+
 
