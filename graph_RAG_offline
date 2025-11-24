@@ -1,7 +1,6 @@
 import pandas as pd
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
-from langchain_ollama import OllamaEmbeddings, OllamaLLM
 import re
 from typing import Any
 import matplotlib.pyplot as plt
@@ -9,59 +8,11 @@ import matplotlib.cm as cm
 import numpy as np
 from llama_index.core.query_engine import CustomQueryEngine
 from llama_index.core.llms import LLM
-from google import genai
-
-# Load markdown file
-with open("src2/novel.md", "r", encoding="utf-8") as f:
-    novel_text = f.read()
-
-# Create a single document from the entire text
-documents = [Document(text=novel_text)]
-
-# Use SentenceSplitter to chunk the document
-splitter = SentenceSplitter(
-    chunk_size=1024,  # Reduced chunk size for better extraction
-    chunk_overlap=20,
-)
-
-nodes = splitter.get_nodes_from_documents(documents)
-
 from llama_index.llms.ollama import Ollama
 from llama_index.llms.vertex import Vertex
 from llama_index.core.llms import ChatMessage, MessageRole
 import vertexai
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
-
-GCP_PROJECT = "finrisk-sandbox"
-GCP_LOCATION = "us-central1"
-vertexai.init(project= GCP_PROJECT, location="us-central1")
-# Configure safety settings to be more permissive
-safety_settings = {
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-}
-
-llm = Vertex(model="gemini-2.5-flash-lite", safety_settings=safety_settings, max_tokens=10000)
-
-
-# Simplified patterns that are easier for the LLM to follow
-entity_pattern = r'ENTITY:\s*(.+?)\s*TYPE:\s*(.+?)\s*DESC:\s*(.+?)(?=\s*ENTITY:|\s*RELATIONSHIP:|\s*$)'
-relationship_pattern = r'RELATIONSHIP:\s*(.+?)\s*->\s*(.+?)\s*TYPE:\s*(.+?)\s*DESC:\s*(.+?)(?=\s*ENTITY:|\s*RELATIONSHIP:|\s*$)'
-
-def parse_fn(response_str: str) -> Any:
-    """More robust parsing function"""
-    print(f"Raw LLM response: {response_str}")  # Debug: see what the LLM is producing
-    
-    entities = re.findall(entity_pattern, response_str, re.DOTALL)
-    relationships = re.findall(relationship_pattern, response_str, re.DOTALL)
-    
-    print(f"Extracted entities: {entities}")  # Debug
-    print(f"Extracted relationships: {relationships}")  # Debug
-    
-    return entities, relationships
-
 import asyncio
 import nest_asyncio
 nest_asyncio.apply()
@@ -74,9 +25,165 @@ from llama_index.core.graph_stores.types import (
     KG_RELATIONS_KEY,
     Relation,
 )
-from llama_index.core.llms.llm import LLM
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import TransformComponent, BaseNode
+from llama_index.core import Settings
+from llama_index.core.graph_stores import SimplePropertyGraphStore
+import networkx as nx
+from graspologic.partition import hierarchical_leiden
+from llama_index.core import PropertyGraphIndex
+from llama_index.embeddings.ollama import OllamaEmbedding
+from visualize_graphs import visualize_hierarchical_communities, visualize_original_graph, visualize_original_graph_detailed, visualize_node_relationship, visualize_entity_network, create_community_wordclouds,visualize_community_relationships
+import time
+
+
+GCP_PROJECT = "finrisk-sandbox"
+GCP_LOCATION = "us-central1"
+vertexai.init(project= GCP_PROJECT, location="us-central1")
+# Configure safety settings to be more permissive
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+llm = Vertex(model="gemini-2.5-flash-lite", safety_settings=safety_settings, max_tokens=15000)
+embeddings = OllamaEmbedding(
+    model_name="tinyLlama:latest",  # Match the LLM model
+)
+
+
+# Simplified prompt that's easier for the LLM to follow
+KG_TRIPLET_EXTRACT_TMPL = """
+-Goal-
+Given a text document, identify all important entities and their types, and extract all relationships among the identified entities.
+Extract up to {max_knowledge_triplets} of the most important entity-relation triplets.
+
+-Steps-
+1. Identify all important ENTITIES from the text. For each entity, extract:
+   - Entity name: Name of the entity (capitalized, use full names when possible)
+   - Entity type: One of: person, organization, location, event, concept, object
+   - Entity description: Comprehensive description of the entity's attributes, role, and activities
+
+   Format each entity as:
+   ENTITY: [entity name]
+   TYPE: [entity type]
+   DESC: [entity description]
+
+2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly and directly related* to each other.
+   Only extract relationships where there is an explicit connection mentioned in the text.
+
+   For each pair of related entities, extract:
+   - Source entity: name of the source entity (exactly as identified in step 1)
+   - Target entity: name of the target entity (exactly as identified in step 1)
+   - Relationship type: Specific relationship type (e.g., works_for, located_in, part_of, involved_in, created_by, member_of, related_to, etc.)
+   - Relationship description: Clear explanation of why these entities are related, based on the text
+
+   Format each relationship as:
+   RELATIONSHIP: [source entity] -> [target entity]
+   TYPE: [relationship type]
+   DESC: [relationship description]
+
+3. Prioritize the most important and clearly stated entities and relationships. Do not extract vague or inferred connections.
+
+-Examples-
+
+Example 1 (Correct Entity Naming):
+Text mentions: "Bacon studied at Trinity College" and "Francis Bacon was a philosopher"
+Extract as:
+ENTITY: Francis Bacon
+TYPE: person
+DESC: English philosopher and statesman
+
+RELATIONSHIP: Francis Bacon -> Trinity College
+TYPE: attended
+DESC: Francis Bacon studied at Trinity College Cambridge
+
+Example 2:
+ENTITY: Trinity College
+TYPE: organization
+DESC: University college in Cambridge where Francis Bacon studied
+
+RELATIONSHIP: Trinity College -> Cambridge
+TYPE: located_in
+DESC: Trinity College is located in the city of Cambridge
+
+-Important Notes-
+- Use the EXACT format shown above with ENTITY:, TYPE:, DESC:, RELATIONSHIP:, and -> symbols
+- Entity names must match exactly between entities and relationships
+- **Maintain consistent naming: if an entity is referred to by different names (e.g., "Francis Bacon" and "Bacon"), use the full canonical name consistently**
+- Only extract relationships that are explicitly stated or clearly implied in the text
+- **Do NOT extract trivial, obvious, or common-sense relationships (e.g., "hand fits into glove", "person wears clothes", "book has pages")**
+- Focus on quality over quantity - extract the most important connections
+- If an entity appears multiple times, use the same name consistently
+- Bacon is the same person as Francis Bacon and all entities of Bacon must be classified as Francis Bacon. 
+
+-Real Data-
+TEXT: {text}
+
+Now analyze this text and extract entities and relationships following the format above:
+"""
+
+
+# Load markdown file
+with open("src2/novel.md", "r", encoding="utf-8") as f:
+    novel_text = f.read()
+
+
+# Create a single document from the entire text
+documents = [Document(text=novel_text)]
+
+# Use SentenceSplitter to chunk the document
+splitter = SentenceSplitter(
+    chunk_size=1024,  # Reduced chunk size for better extraction
+    chunk_overlap=20,
+)
+
+nodes = splitter.get_nodes_from_documents(documents)
+
+# Simplified patterns that are easier for the LLM to follow
+entity_pattern = r'ENTITY:\s*(.+?)\s*TYPE:\s*(.+?)\s*DESC:\s*(.+?)(?=\s*ENTITY:|\s*RELATIONSHIP:|\s*$)'
+relationship_pattern = r'RELATIONSHIP:\s*(.+?)\s*->\s*(.+?)\s*TYPE:\s*(.+?)\s*DESC:\s*(.+?)(?=\s*ENTITY:|\s*RELATIONSHIP:|\s*$)'
+
+def canonicalize_bacon(entity_name: str) -> str:
+    """
+    Force all Bacon variants to canonical 'Francis Bacon'.
+    Set a breakpoint whenever a canonicalization happens.
+    """
+    name_clean = entity_name.strip()
+
+    if name_clean == 'Bacon' or name_clean == 'Sir Francis Bacon':
+        # Trigger breakpoint only when conversion occurs
+        print(f"[CANONICALIZING] '{entity_name}' -> 'Francis Bacon'")
+        a=1
+        return "Francis Bacon"
+    
+    return name_clean
+
+def parse_fn(response_str: str) -> Any:
+    """More robust parsing function"""
+    print(f"Raw LLM response: {response_str}")  # Debug: see what the LLM is producing
+    
+    entities = re.findall(entity_pattern, response_str, re.DOTALL)
+    relationships = re.findall(relationship_pattern, response_str, re.DOTALL)
+
+    canonical_entities = []
+    for name, ent_type, desc in entities:
+        canonical_name = canonicalize_bacon(name)
+        canonical_entities.append((canonical_name, ent_type, desc))
+
+    # --- Canonicalize references inside relationships
+    canonical_relationships = []
+    for src, tgt, rel_type, desc in relationships:
+        canonical_src = canonicalize_bacon(src)
+        canonical_tgt = canonicalize_bacon(tgt)
+        canonical_relationships.append((canonical_src, canonical_tgt, rel_type, desc))
+    
+    print(f"Extracted entities: {entities}")  # Debug
+    print(f"Extracted relationships: {relationships}")  # Debug
+    
+    return canonical_entities, canonical_relationships
 
 class GraphRAGExtractor(TransformComponent):
     """Fixed GraphRAG extractor with better error handling"""
@@ -95,7 +202,7 @@ class GraphRAGExtractor(TransformComponent):
         max_paths_per_chunk: int = 5,  # Increased for better coverage
         num_workers: int = 2,  # Reduced for stability
     ) -> None:
-        from llama_index.core import Settings
+
 
         if isinstance(extract_prompt, str):
             extract_prompt = PromptTemplate(extract_prompt)
@@ -189,72 +296,6 @@ class GraphRAGExtractor(TransformComponent):
             desc="Extracting paths from text",
         )
 
-# Simplified prompt that's easier for the LLM to follow
-KG_TRIPLET_EXTRACT_TMPL = """
--Goal-
-Given a text document, identify all important entities and their types, and extract all relationships among the identified entities.
-Extract up to {max_knowledge_triplets} of the most important entity-relation triplets.
-
--Steps-
-1. Identify all important ENTITIES from the text. For each entity, extract:
-   - Entity name: Name of the entity (capitalized, use full names when possible)
-   - Entity type: One of: person, organization, location, event, concept, object
-   - Entity description: Comprehensive description of the entity's attributes, role, and activities
-
-   Format each entity as:
-   ENTITY: [entity name]
-   TYPE: [entity type]
-   DESC: [entity description]
-
-2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly and directly related* to each other.
-   Only extract relationships where there is an explicit connection mentioned in the text.
-
-   For each pair of related entities, extract:
-   - Source entity: name of the source entity (exactly as identified in step 1)
-   - Target entity: name of the target entity (exactly as identified in step 1)
-   - Relationship type: Specific relationship type (e.g., works_for, located_in, part_of, involved_in, created_by, member_of, related_to, etc.)
-   - Relationship description: Clear explanation of why these entities are related, based on the text
-
-   Format each relationship as:
-   RELATIONSHIP: [source entity] -> [target entity]
-   TYPE: [relationship type]
-   DESC: [relationship description]
-
-3. Prioritize the most important and clearly stated entities and relationships. Do not extract vague or inferred connections.
-
--Examples-
-
-Example 1:
-ENTITY: Francis Bacon
-TYPE: person
-DESC: English philosopher and statesman, born in 1560
-
-RELATIONSHIP: Francis Bacon -> Trinity College
-TYPE: attended
-DESC: Studied at Trinity College Cambridge
-
-Example 2:
-ENTITY: Trinity College
-TYPE: organization
-DESC: University college in Cambridge where Francis Bacon studied
-
-RELATIONSHIP: Trinity College -> Cambridge
-TYPE: located_in
-DESC: Trinity College is located in the city of Cambridge
-
--Important Notes-
-- Use the EXACT format shown above with ENTITY:, TYPE:, DESC:, RELATIONSHIP:, and -> symbols
-- Entity names must match exactly between entities and relationships
-- Only extract relationships that are explicitly stated or clearly implied in the text
-- Focus on quality over quantity - extract the most important connections
-- If an entity appears multiple times, use the same name consistently
-
--Real Data-
-TEXT: {text}
-
-Now analyze this text and extract entities and relationships following the format above:
-"""
-
 kg_extractor = GraphRAGExtractor(
     llm=llm,
     extract_prompt=KG_TRIPLET_EXTRACT_TMPL,
@@ -263,14 +304,9 @@ kg_extractor = GraphRAGExtractor(
     num_workers=1,  # Start with 1 worker for debugging
 )
 
-from llama_index.core.graph_stores import SimplePropertyGraphStore
-import networkx as nx
-from graspologic.partition import hierarchical_leiden
-from llama_index.core.llms import ChatMessage
-
 class GraphRAGStore(SimplePropertyGraphStore):
     community_summary = {}
-    max_cluster_size = 5
+    max_cluster_size = 20
 
     def generate_community_summary(self, text):
         """Generate summary for a given text using an LLM."""
@@ -380,8 +416,15 @@ class GraphRAGStore(SimplePropertyGraphStore):
         """Converts internal graph representation to NetworkX graph."""
         nx_graph = nx.Graph()
         for node in self.graph.nodes.values():
+            if node.id == "Bacon":
+              a=1
             nx_graph.add_node(str(node))
         for relation in self.graph.relations.values():
+            if relation.source_id == 'Bacon':
+                a=1
+            if relation.target_id == 'Bacon':
+                a=1
+
             nx_graph.add_edge(
                 relation.source_id,
                 relation.target_id,
@@ -411,12 +454,13 @@ class GraphRAGStore(SimplePropertyGraphStore):
     def _summarize_communities(self, community_info):
         """Generate and store summaries for each community."""
         for community_id, details in community_info.items():
-            details_text = (
-                "\n".join(details) + "."
-            )  # Ensure it ends with a period
-            self.community_summary[
-                community_id
-            ] = self.generate_community_summary(details_text)
+            if len(details) > 0:
+             details_text = (
+                "\n".join(details) + ".")  # Ensure it ends with a period
+                
+             self.community_summary[community_id] = self.generate_community_summary(details_text)
+            else:
+               self.community_summary[community_id] = 'None' 
 
     def get_community_summaries(self):
         """Returns the community summaries, building them if not already done."""
@@ -427,12 +471,8 @@ class GraphRAGStore(SimplePropertyGraphStore):
             self.build_communities()
         return self.community_summary
 
-from llama_index.core import PropertyGraphIndex
-from llama_index.embeddings.ollama import OllamaEmbedding
 
-embeddings = OllamaEmbedding(
-    model_name="tinyLlama:latest",  # Match the LLM model
-)
+
 
 # Create index with debug info
 print("Creating PropertyGraphIndex...")
@@ -445,7 +485,7 @@ print("Creating PropertyGraphIndex...")
 #     show_progress=True,
 # )
 
-PERSIST_DIR = "Novel"
+PERSIST_DIR = "Novel2"
 from llama_index.core import (
     PropertyGraphIndex,
     StorageContext,
@@ -466,14 +506,14 @@ index = load_index_from_storage(storage_context, llm=llm, embed_model=embeddings
 # Check if we have any data in the graph
 print(f"Graph store nodes: {len(index.property_graph_store.graph.nodes)}")
 print(f"Graph store relations: {len(index.property_graph_store.graph.relations)}")
+# create_community_wordclouds(index, [128, 210])
 
-# Only build communities if we have data
 if (index.property_graph_store.graph.nodes and 
     index.property_graph_store.graph.relations):
-    index.storage_context.persist(persist_dir="Novel1")
+    #index.storage_context.persist(persist_dir="Novel2")
     print("Building communities...")
-    # index.property_graph_store.build_communities()
-    # index.storage_context.persist(persist_dir=PERSIST_DIR)
+    #index.property_graph_store.build_communities()
+    #index.storage_context.persist(persist_dir=PERSIST_DIR)
    
 else:
     print("No graph data extracted. Check the LLM extraction output.")
@@ -486,40 +526,95 @@ class GraphRAGQueryEngine(CustomQueryEngine):
     graph_store: GraphRAGStore
     llm: LLM
 
-    def custom_query(self, query_str: str) -> str:
-        """Process all community summaries to generate answers to a specific query."""
+    def custom_query(self, query_str: str) -> Dict:
+        """
+        The synchronous wrapper that the user calls.
+        It sets up and runs the main asynchronous logic.
+        """
+        print("--- Kicking off parallel query execution ---")
+        start_time = time.time()
+
+        # Use asyncio.run() to execute the async version of the query method
+        results = asyncio.run(self.a_custom_query(query_str))
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"\n--- Parallel execution finished in {total_time:.2f} seconds ---")
+        
+        # Add the total time to the final results for proof
+        results['total_processing_time'] = total_time
+        return results
+    
+    async def a_custom_query(self, query_str: str) -> Dict:
+        """
+        The core asynchronous logic that runs all LLM calls concurrently.
+        """
         community_summaries = self.graph_store.get_community_summaries()
-        community_answers = [
-            self.generate_answer_from_summary(community_summary, query_str)
-            for _, community_summary in community_summaries.items()
-        ]
+        
+        # --- Create a list of tasks to run in parallel ---
+        # Instead of a for loop that waits, we create a list of "coroutines"
+        # that can all be started at once.
+        tasks = []
+        for community_id, summary in community_summaries.items():
+            task = self.a_generate_answer_from_summary(summary, query_str, community_id)
+            tasks.append(task)
+        
+        # --- Run all tasks concurrently and wait for them all to finish ---
+        # asyncio.gather() is the magic that runs everything at the same time.
+        community_results = await asyncio.gather(*tasks)
+        
+        # --- Process the results after they are all complete ---
+        contributing_communities = [res for res in community_results if res['contributed']]
+        
+        if not contributing_communities:
+            return {
+                'answer': "No relevant information found to answer your question.",
+                'contributing_communities': [],
+                'all_communities': community_results,
+            }
 
-        final_answer = self.aggregate_answers(community_answers)
-        return final_answer
+        # Aggregate the final answer from the communities that contributed
+        final_answer = await self.a_aggregate_answers([r['answer'] for r in contributing_communities])
 
-    def generate_answer_from_summary(self, community_summary, query):
-        """Generate an answer from a community summary based on a given query using LLM."""
-        prompt = (
-            f"QUERY: {query}\n\n"
-            f"COMMUNITY SUMMARY: {community_summary}\n\n"
-            "INSTRUCTIONS:\n"
-            "1. If the community summary contains information that answers the query, provide a concise answer.\n"
-            "2. If the community summary does NOT contain relevant information to answer the query, output exactly: null\n"
-            "3. Do not make up information or try to be helpful beyond what's in the summary.\n\n"
-            "OUTPUT FORMAT: Either a direct answer or 'null'"
-        )
-        
-        messages = [
-            ChatMessage(role="system", content=prompt),
-            ChatMessage(role="user", content="Provide your response based on the instructions above."),
-        ]
-        
-        response = self.llm.chat(messages)
-        cleaned_response = re.sub(r"^assistant:\s*", "", str(response)).strip()
-        
-        # Force null if the response indicates no relevance
-        
-        return cleaned_response
+        return {
+            'answer': final_answer,
+            'contributing_communities': contributing_communities,
+            'all_communities': community_results,
+            'num_contributing': len(contributing_communities),
+            'total_communities': len(community_results)
+        }
+    
+    async def a_generate_answer_from_summary(self, community_summary, query, community_id):
+        """
+        The ASYNCHRONOUS version of the LLM call function.
+        """
+        # Your original logic is mostly the same
+        if community_summary == 'None': # Your check
+            answer = 'null'
+        else:
+            prompt = (
+                f"QUERY: {query}\n\n"
+                f"COMMUNITY SUMMARY: {community_summary}\n\n"
+                "INSTRUCTIONS:\n"
+                "1. If the community summary is relevant, provide a concise answer.\n"
+                "2. If not relevant, output exactly: null\n\n"
+                "OUTPUT:"
+            )
+            messages = [ChatMessage(role="user", content=prompt)]
+            
+            # --- Use the async `achat` method for the LLM call ---
+            response = await self.llm.achat(messages)
+            answer = re.sub(r"^assistant:\s*", "", str(response)).strip()
+
+        is_contributed = answer.lower() != "null" and answer.strip() != "" and answer != 'assistant: null'
+        if is_contributed:
+            a=1
+        return {
+            'community_id': community_id,
+            'summary': community_summary,
+            'answer': answer,
+            'contributed': is_contributed
+        }
 
     def aggregate_answers(self, community_answers):
         """Aggregate individual community answers into a final, coherent response."""
@@ -537,439 +632,39 @@ class GraphRAGQueryEngine(CustomQueryEngine):
             r"^assistant:\s*", "", str(final_response)
         ).strip()
         return cleaned_final_response
+    
+    async def a_aggregate_answers(self, relevant_answers: List[str]) -> str:
+        """Asynchronous aggregation of final answers."""
+        prompt = "Combine the following pieces of information into a final, coherent answer."
+        answers_str = "\n".join([f"- {ans}" for ans in relevant_answers])
+        messages = [
+            ChatMessage(role="system", content=prompt),
+            ChatMessage(role="user", content=f"Information found:\n{answers_str}"),
+        ]
+        response = await self.llm.achat(messages)
+        cleaned_final_response = re.sub(
+            r"^assistant:\s*", "", str(response)
+        ).strip()
+        return cleaned_final_response
 
-llm = Ollama(
-    model="qwen3:4b-instruct",  # Using a more reliable model for extraction
-    request_timeout=6000.0,
-)
+llm = Vertex(model="gemini-2.5-flash-lite", safety_settings=safety_settings, max_tokens=1000)
+
 query_engine = GraphRAGQueryEngine(
     graph_store=index.property_graph_store, llm=llm
 )
-# with open('graphrag_query_engine.pkl', 'rb') as f:
-#         import pickle
-#         query_engine = pickle.load(f)
 
-response = query_engine.query("Where did Francis Bacon study?")
-print(f"{response.response}")
+response = query_engine.query("Who claimed that knowledge causes anxiety, discontent and rebellion?")
+print(f"{response['answer']}")
 
-# Get community graph
-community_graph, community_nodes = index.property_graph_store.get_community_graph()
+contributing_communities = response['contributing_communities']
 
-if community_graph.number_of_nodes() > 0:
-    # Create figure
-    fig, ax = plt.subplots(figsize=(20, 15))
-    
-    # Use spring layout for positioning
-    pos = nx.spring_layout(community_graph, k=2, iterations=50)
-    
-    # Get node sizes based on number of connections (degree)
-    node_sizes = [community_graph.degree(node) * 1000 + 2000 for node in community_graph.nodes()]
-    
-    # Color nodes by community ID (using a colormap)
-    node_colors = [hash(str(node)) % 256 for node in community_graph.nodes()]
-    cmap = cm.get_cmap('tab20')
-    colors = [cmap(i % 20) for i in range(len(node_colors))]
-    
-    # Draw nodes
-    nx.draw_networkx_nodes(community_graph, pos, 
-                          node_color=colors,
-                          node_size=node_sizes,
-                          alpha=0.8,
-                          ax=ax)
-    
-    # Draw edges with thickness based on weight (number of connections)
-    edges = community_graph.edges()
-    edge_weights = [community_graph[u][v].get('weight', 1) for u, v in edges]
-    nx.draw_networkx_edges(community_graph, pos,
-                          width=[w * 0.5 for w in edge_weights],
-                          alpha=0.6,
-                          edge_color='gray',
-                          ax=ax)
-    
-    # Create labels with community summaries
-    labels = {}
-    for node in community_graph.nodes():
-        summary = community_nodes.get(node, f"Community {node}")
-        # Create multi-line label (first line: ID, second: summary)
-        labels[node] = f"C{node}\n{summary[:50]}..."
-    
-    nx.draw_networkx_labels(community_graph, pos, labels, 
-                           font_size=8, font_weight='bold', ax=ax)
-    
-    # Add edge labels showing relationship types
-    edge_labels = {}
-    for u, v, data in community_graph.edges(data=True):
-        relationships = data.get('relationships', [])
-        unique_rels = list(set(relationships))[:3]  # Show up to 3 unique relationship types
-        edge_labels[(u, v)] = f"{len(relationships)} links\n{', '.join(unique_rels)}"
-    
-    nx.draw_networkx_edge_labels(community_graph, pos, edge_labels, 
-                                font_size=6, ax=ax)
-    
-    plt.title("Simplified Community Graph\n(Nodes = Communities, Edges = Inter-community connections)", 
-              size=16, fontweight='bold')
-    plt.axis('off')
-    plt.tight_layout()
-    plt.show()
-    
-    # Print statistics
-    print("\n" + "="*60)
-    print("COMMUNITY GRAPH STATISTICS")
-    print("="*60)
-    print(f"Number of communities: {community_graph.number_of_nodes()}")
-    print(f"Inter-community connections: {community_graph.number_of_edges()}")
-    print(f"\nCommunity Details:")
-    for node in sorted(community_graph.nodes()):
-        degree = community_graph.degree(node)
-        summary = community_nodes.get(node, "No summary")
-        print(f"\n  Community {node}:")
-        print(f"    Connections to other communities: {degree}")
-        print(f"    Summary: {summary[:10]}...")
-else:
-    print("No communities found in the graph.")
-def visualize_hierarchical_communities(index, level_0_max_size=None, level_1_max_size=None):
-    """
-    Create side-by-side visualization of communities at two hierarchical levels.
-    Similar to the research paper figure.
-    """
-    nx_graph = index.property_graph_store._create_nx_graph()
-    
-    # Get communities at level 0 (coarse/root)
-    if level_0_max_size is None:
-        level_0_max_size = max(50, len(nx_graph.nodes()) // 5)
-    clusters_level_0 = hierarchical_leiden(nx_graph, max_cluster_size=level_0_max_size)
-    mapping_level_0 = {item.node: item.cluster for item in clusters_level_0}
-    
-    # Get communities at level 1 (finer)
-    if level_1_max_size is None:
-        level_1_max_size = index.property_graph_store.max_cluster_size
-    clusters_level_1 = hierarchical_leiden(nx_graph, max_cluster_size=level_1_max_size)
-    mapping_level_1 = {item.node: item.cluster for item in clusters_level_1}
-    
-    # Create figure with two subplots side by side
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 12))
-    
-    # Use the same layout for both graphs for comparison
-    pos = nx.spring_layout(nx_graph, k=1, iterations=50, seed=42)
-    
-    # Get unique communities for coloring
-    communities_0 = set(mapping_level_0.values())
-    communities_1 = set(mapping_level_1.values())
-    
-    # Create color maps
-    cmap_0 = cm.get_cmap('tab20')
-    cmap_1 = cm.get_cmap('tab20')
-    colors_0 = {comm: cmap_0(i % 20) for i, comm in enumerate(communities_0)}
-    colors_1 = {comm: cmap_1(i % 20) for i, comm in enumerate(communities_1)}
-    
-    # Add fallback color for unmapped nodes
-    default_color = (0.5, 0.5, 0.5, 1.0)  # Gray
-    colors_0[-1] = default_color
-    colors_1[-1] = default_color
-    
-    # Plot Level 0 (Root communities) - Graph (a)
-    node_colors_0 = []
-    for node in nx_graph.nodes():
-        comm_id = mapping_level_0.get(node, -1)
-        node_colors_0.append(colors_0.get(comm_id, default_color))
-    
-    nx.draw_networkx_nodes(nx_graph, pos, 
-                          node_color=node_colors_0,
-                          node_size=50,
-                          alpha=0.8,
-                          ax=ax1,
-                          edgecolors='black',
-                          linewidths=0.5)
-    nx.draw_networkx_edges(nx_graph, pos,
-                          alpha=0.2,
-                          edge_color='gray',
-                          width=0.5,
-                          ax=ax1)
-    ax1.set_title(f'(a) Root communities at level 0\n({len(communities_0)} communities, max_size={level_0_max_size})', 
-                  fontsize=14, fontweight='bold', pad=20)
-    ax1.axis('off')
-    
-    # Plot Level 1 (Sub-communities) - Graph (b)
-    node_colors_1 = []
-    for node in nx_graph.nodes():
-        comm_id = mapping_level_1.get(node, -1)
-        node_colors_1.append(colors_1.get(comm_id, default_color))
-    
-    nx.draw_networkx_nodes(nx_graph, pos, 
-                          node_color=node_colors_1,
-                          node_size=50,
-                          alpha=0.8,
-                          ax=ax2,
-                          edgecolors='black',
-                          linewidths=0.5)
-    nx.draw_networkx_edges(nx_graph, pos,
-                          alpha=0.2,
-                          edge_color='gray',
-                          width=0.5,
-                          ax=ax2)
-    ax2.set_title(f'(b) Sub-communities at level 1\n({len(communities_1)} communities, max_size={level_1_max_size})', 
-                  fontsize=14, fontweight='bold', pad=20)
-    ax2.axis('off')
-    
-    plt.suptitle('Hierarchical Community Detection', fontsize=16, fontweight='bold', y=0.98)
-    plt.tight_layout()
-    plt.show()
-    
-    # Print statistics
-    print("\n" + "="*60)
-    print("HIERARCHICAL COMMUNITY STATISTICS")
-    print("="*60)
-    print(f"\nLevel 0 (Root):")
-    print(f"  Number of communities: {len(communities_0)}")
-    print(f"  Average community size: {len(nx_graph.nodes()) / len(communities_0):.1f} nodes")
-    
-    print(f"\nLevel 1 (Sub-communities):")
-    print(f"  Number of communities: {len(communities_1)}")
-    print(f"  Average community size: {len(nx_graph.nodes()) / len(communities_1):.1f} nodes")
-    
-    # Show how level 0 communities are subdivided
-    print(f"\nCommunity Subdivision Analysis:")
-    comm_0_to_1 = {}
-    for node in nx_graph.nodes():
-        comm_0 = mapping_level_0.get(node)
-        comm_1 = mapping_level_1.get(node)
-        if comm_0 not in comm_0_to_1:
-            comm_0_to_1[comm_0] = set()
-        comm_0_to_1[comm_0].add(comm_1)
-    
-    # for comm_0, sub_comms in sorted(comm_0_to_1.items())[:5]:  # Show first 5
-    #     print(f"  Level 0 Community {comm_0} contains {len(sub_comms)} sub-communities at Level 1")
-# Call the visualization function
+community_ids = []
+for comm in contributing_communities:
+ community_ids.append(comm['community_id'])
+
+# Usage:
+visualize_community_relationships(index, community_ids)
+create_community_wordclouds(index, community_ids)
 visualize_hierarchical_communities(index)
-
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import networkx as nx
-
-def visualize_original_graph(index):
-    """
-    Visualize the original knowledge graph with all entities (nodes) and relationships (edges).
-    """
-    # Get the NetworkX graph from the index
-    nx_graph = index.property_graph_store._create_nx_graph()
-    
-    if nx_graph.number_of_nodes() == 0:
-        print("Graph is empty - no nodes to visualize.")
-        return
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=(20, 16))
-    
-    # Use a layout algorithm (spring layout works well for general graphs)
-    # Adjust k parameter for spacing (larger = more spread out)
-    pos = nx.spring_layout(nx_graph, k=2, iterations=50, seed=42)
-    
-    # Calculate node sizes based on degree (more connections = larger node)
-    degrees = dict(nx_graph.degree())
-    node_sizes = [degrees[node] * 300 + 200 for node in nx_graph.nodes()]
-    
-    # Color nodes by degree (more connected = darker)
-    node_colors = [degrees[node] for node in nx_graph.nodes()]
-    
-    # Draw nodes
-    nodes = nx.draw_networkx_nodes(
-        nx_graph, 
-        pos,
-        node_color=node_colors,
-        node_size=node_sizes,
-        cmap=plt.cm.viridis,  # Color map: darker = more connections
-        alpha=0.8,
-        edgecolors='black',
-        linewidths=1.5,
-        ax=ax
-    )
-    
-    # Draw edges
-    nx.draw_networkx_edges(
-        nx_graph,
-        pos,
-        alpha=0.3,
-        edge_color='gray',
-        width=1.0,
-        ax=ax
-    )
-    
-    # Draw node labels (entity names)
-    # Only show labels for nodes with high degree to avoid clutter
-    high_degree_nodes = {node: label for node, label in zip(nx_graph.nodes(), nx_graph.nodes()) 
-                         if degrees[node] >= 3}  # Only label nodes with 3+ connections
-    
-    if high_degree_nodes:
-        nx.draw_networkx_labels(
-            nx_graph,
-            pos,
-            labels=high_degree_nodes,
-            font_size=8,
-            font_weight='bold',
-            ax=ax
-        )
-    
-    # Add colorbar for node degree
-    plt.colorbar(nodes, ax=ax, label='Number of Connections (Degree)')
-    
-    plt.title(f'Original Knowledge Graph\n({nx_graph.number_of_nodes()} entities, {nx_graph.number_of_edges()} relationships)', 
-              fontsize=16, fontweight='bold', pad=20)
-    plt.axis('off')
-    plt.tight_layout()
-    plt.show()
-    
-    # Print statistics
-    print("\n" + "="*60)
-    print("KNOWLEDGE GRAPH STATISTICS")
-    print("="*60)
-    print(f"Total entities (nodes): {nx_graph.number_of_nodes()}")
-    print(f"Total relationships (edges): {nx_graph.number_of_edges()}")
-    print(f"Average connections per entity: {sum(degrees.values()) / len(degrees):.2f}")
-    print(f"\nMost connected entities:")
-    sorted_degrees = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
-    for i, (node, degree) in enumerate(sorted_degrees[:10], 1):
-        print(f"  {i}. {node}: {degree} connections")
-    
-    return nx_graph
-
-# Call the function
 visualize_original_graph(index)
-
-def visualize_original_graph_detailed(index, max_nodes=100):
-    """
-    Visualize with relationship type labels and entity details.
-    If graph is too large, only show a subset.
-    """
-    nx_graph = index.property_graph_store._create_nx_graph()
-    
-    if nx_graph.number_of_nodes() == 0:
-        print("Graph is empty.")
-        return
-    
-    # If graph is too large, create a subgraph with most connected nodes
-    if nx_graph.number_of_nodes() > max_nodes:
-        print(f"Graph has {nx_graph.number_of_nodes()} nodes. Showing top {max_nodes} most connected nodes.")
-        degrees = dict(nx_graph.degree())
-        top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
-        top_node_list = [node for node, _ in top_nodes]
-        nx_graph = nx_graph.subgraph(top_node_list)
-    
-    # Create mapping from node IDs to clean names
-    node_id_to_name = {}
-    for node_obj in index.property_graph_store.graph.nodes.values():
-        node_id = str(node_obj.id) if hasattr(node_obj, 'id') else str(node_obj)
-        node_name = node_obj.name if hasattr(node_obj, 'name') else str(node_obj)
-        node_id_to_name[node_id] = node_name
-    
-    # Create a new graph with clean node names
-    clean_graph = nx.Graph()
-    for node_id in nx_graph.nodes():
-        clean_name = node_id_to_name.get(node_id, node_id)
-        clean_graph.add_node(clean_name)
-    
-    # Add edges with clean labels
-    for u, v, data in nx_graph.edges(data=True):
-        u_clean = node_id_to_name.get(u, u)
-        v_clean = node_id_to_name.get(v, v)
-        rel_label = data.get('relationship', 'related_to')
-        clean_graph.add_edge(u_clean, v_clean, relationship=rel_label)
-    
-    fig, ax = plt.subplots(figsize=(24, 18))
-    
-    pos = nx.spring_layout(clean_graph, k=2, iterations=50, seed=42)
-    
-    # Node sizes and colors
-    degrees = dict(clean_graph.degree())
-    node_sizes = [degrees[node] * 400 + 300 for node in clean_graph.nodes()]
-    node_colors = [degrees[node] for node in clean_graph.nodes()]
-    
-    # Draw nodes
-    nodes = nx.draw_networkx_nodes(
-        clean_graph, pos,
-        node_color=node_colors,
-        node_size=node_sizes,
-        cmap=plt.cm.plasma,
-        alpha=0.9,
-        edgecolors='black',
-        linewidths=2,
-        ax=ax
-    )
-    
-    # Draw edges
-    nx.draw_networkx_edges(
-        clean_graph, pos,
-        alpha=0.4,
-        edge_color='gray',
-        width=1.5,
-        ax=ax
-    )
-    
-    # Add edge labels (relationship types) - only for a subset to avoid clutter
-    edge_labels = {}
-    for u, v, data in list(clean_graph.edges(data=True))[:50]:  # Show first 50 edges
-        rel = data.get('relationship', '')
-        if rel:
-            edge_labels[(u, v)] = rel[:15]  # Truncate long names
-    
-    nx.draw_networkx_edge_labels(
-        clean_graph, pos,
-        edge_labels=edge_labels,
-        font_size=6,
-        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
-        ax=ax
-    )
-    
-    # Add node labels (entity names)
-    nx.draw_networkx_labels(
-        clean_graph, pos,
-        font_size=7,
-        font_weight='bold',
-        ax=ax
-    )
-    
-    plt.colorbar(nodes, ax=ax, label='Number of Connections')
-    plt.title(f'Original Knowledge Graph (Detailed View)\n{clean_graph.number_of_nodes()} entities, {clean_graph.number_of_edges()} relationships',
-              fontsize=16, fontweight='bold')
-    plt.axis('off')
-    plt.tight_layout()
-    plt.show()
-
-# Call it
 visualize_original_graph_detailed(index)
-
-from wordcloud import WordCloud
-import matplotlib.pyplot as plt
-
-def create_community_wordclouds(index):
-    """Create word clouds for each community summary."""
-    summaries = index.property_graph_store.get_community_summaries()
-    
-    n_communities = len(summaries)
-    cols = 3
-    rows = (n_communities + cols - 1) // cols
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(18, 6*rows))
-    axes = axes.flatten() if n_communities > 1 else [axes]
-    
-    for idx, (comm_id, summary) in enumerate(summaries.items()):
-        if idx >= len(axes):
-            break
-            
-        wordcloud = WordCloud(width=800, height=400, 
-                             background_color='white',
-                             max_words=50).generate(summary)
-        
-        axes[idx].imshow(wordcloud, interpolation='bilinear')
-        axes[idx].set_title(f'Community {comm_id}', fontsize=12, fontweight='bold')
-        axes[idx].axis('off')
-    
-    # Hide unused subplots
-    for idx in range(len(summaries), len(axes)):
-        axes[idx].axis('off')
-    
-    plt.tight_layout()
-    plt.show()
-
-create_community_wordclouds(index)
-
-# Install: pip install wordcloud
